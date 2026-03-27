@@ -19,6 +19,7 @@
 #include <utility>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 #include <unordered_map>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
@@ -36,6 +37,8 @@ struct PartitionDebugInfo {
     uint64_t n_overflow  = 0;   // insertions that went to overflow table
     uint64_t table_cap   = 0;   // final flat-table capacity (k-mer slots)
     uint64_t n_buckets   = 0;   // table_cap / B
+    double   count_s     = 0.0; // count_partition wall time
+    double   write_s     = 0.0; // write_counts wall time
 
     // Resize events recorded during count_partition for this partition.
     std::vector<kache_hash::ResizeEvent> resize_log;
@@ -45,6 +48,12 @@ struct PartitionDebugInfo {
     std::unordered_map<uint32_t, uint64_t> coverage_hist;
 };
 
+inline double count_count_elapsed_s(std::chrono::steady_clock::time_point t0)
+{
+    using Sec = std::chrono::duration<double>;
+    return Sec(std::chrono::steady_clock::now() - t0).count();
+}
+
 
 // ─── Counting brick ───────────────────────────────────────────────────────────
 //
@@ -52,14 +61,14 @@ struct PartitionDebugInfo {
 // The table must be private to the calling thread (mt_=false, no locking).
 //
 // The stored min_pos header byte lets Phase 2 compute ntHash(minimizer) in O(m)
-// instead of running MinimizerWindow::reset() in O(k).  All k-mers in the
-// superkmer share the same minimizer, so init_packed_with_hash sets the bucket
-// hash once and advance() skips nt_min entirely.  A single prefetch() hides
-// the LLC miss (~200 ns) behind the O(m) lmer hash computation.
+// instead of running MinimizerWindow::reset() in O(k). The stored first k-mer
+// removes the decode/rebuild of the first window entirely; Phase 2 only unpacks
+// suffix bases after that initial k-mer. A single prefetch() hides the LLC
+// miss (~200 ns) behind the O(m) lmer hash computation.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
-template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader>
+template <uint16_t k, uint16_t m, typename Reader = SuperkmerReader<k>>
 uint64_t count_partition(
     Reader&                                                               reader,
     kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
@@ -74,13 +83,13 @@ uint64_t count_partition(
     // Maps minimizer_hash → total k-mers sharing that minimizer in this partition.
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
 
-    // 1-ahead prefetch: for each superkmer N, issue prefetch_packed for N+1
+    // 1-ahead prefetch: for each superkmer N, issue prefetch_first_kmer for N+1
     // BEFORE processing N, hiding the ~40 ns LLC miss behind N's hot loop.
     //
     // Timing model (k=31, m=21, typical superkmer = 11 k-mers):
-    //   T+0:   prefetch_packed(nxt)  — O(m≈21) hash, ~5 ns, miss starts
+    //   T+0:   prefetch_first_kmer(nxt)  — O(m≈21) hash, ~5 ns, miss starts
     //   T+5:   process cur: 11 upserts × ~2 ns ≈ 22 ns
-    //   T+27:  init_packed_with_min(nxt) — O(k+m≈52) ≈ 20 ns
+    //   T+27:  init_first_kmer_with_min(nxt) — O(m) ≈ 5 ns
     //   T+47:  first upsert(nxt)  — LLC miss resolves at T+45 ns → ~2 ns stall
     //   vs current: 0 ns of overlap → 40 ns stall per superkmer.
     //
@@ -90,30 +99,32 @@ uint64_t count_partition(
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
 
-    const uint8_t* cur_packed  = reader.packed_data();
+    uint64_t       cur_first_kmer = reader.first_kmer();
+    const uint8_t* cur_suffix     = reader.suffix_data();
     size_t         cur_len     = reader.size();
     uint8_t        cur_min_pos = reader.min_pos();
 
     kache_hash::Kmer_Window<k, m> win;
     if (cur_len >= k) {
         if (cur_min_pos != 0xFF) {
-            const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
+            const uint64_t mh = win.init_first_kmer_with_min(cur_first_kmer, cur_min_pos);
             if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
         } else {
-            win.init_packed(cur_packed);
+            win.init_first_kmer(cur_first_kmer);
         }
         table.prefetch(win);  // cold-start: no previous superkmer to hide behind
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     while (reader.next()) {
-        const uint8_t* nxt_packed  = reader.packed_data();
+        const uint64_t  nxt_first_kmer = reader.first_kmer();
+        const uint8_t*  nxt_suffix     = reader.suffix_data();
         const size_t   nxt_len     = reader.size();
         const uint8_t  nxt_min_pos = reader.min_pos();
 
         // Issue prefetch for NEXT bucket BEFORE processing CURRENT superkmer.
         if (nxt_len >= k && nxt_min_pos != 0xFF)
-            table.prefetch_packed(nxt_packed, nxt_min_pos);
+            table.prefetch_first_kmer(nxt_first_kmer, nxt_min_pos);
 
         // Process CURRENT superkmer.
         if (cur_len >= k) {
@@ -121,8 +132,8 @@ uint64_t count_partition(
             ++inserted;
 
             // Unpack subsequent bases directly as DNA::Base (kache encoding).
-            const uint8_t* byte_ptr = cur_packed + (k >> 2);
-            int shift = static_cast<int>(6u - 2u * (k & 3u));
+            const uint8_t* byte_ptr = cur_suffix;
+            int shift = 6;
             for (size_t i = k; i < cur_len; ++i) {
                 const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
                 shift -= 2;
@@ -134,15 +145,16 @@ uint64_t count_partition(
         }
 
         // Advance to next: reinitialise window from the already-prefetched data.
-        cur_packed  = nxt_packed;
+        cur_first_kmer = nxt_first_kmer;
+        cur_suffix  = nxt_suffix;
         cur_len     = nxt_len;
         cur_min_pos = nxt_min_pos;
         if (cur_len >= k) {
             if (cur_min_pos != 0xFF) {
-                const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
+                const uint64_t mh = win.init_first_kmer_with_min(cur_first_kmer, cur_min_pos);
                 if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
             } else {
-                win.init_packed(cur_packed);
+                win.init_first_kmer(cur_first_kmer);
                 table.prefetch(win);  // 0xFF fallback: prefetch after init
             }
         }
@@ -152,8 +164,8 @@ uint64_t count_partition(
     if (cur_len >= k) {
         table.upsert(win, inc, uint32_t(1), token);
         ++inserted;
-        const uint8_t* byte_ptr = cur_packed + (k >> 2);
-        int shift = static_cast<int>(6u - 2u * (k & 3u));
+        const uint8_t* byte_ptr = cur_suffix;
+        int shift = 6;
         for (size_t i = k; i < cur_len; ++i) {
             const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
             shift -= 2;
@@ -256,7 +268,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
         std::string chunk;
 
         for (size_t p = tid; p < n_parts; p += n_threads) {
-            SuperkmerReader reader(partition_path(cfg.work_dir, p));
+            SuperkmerReader<k> reader(partition_path(cfg.work_dir, p));
             // Size the table generously to avoid load-triggered resizes.
             //
             // Dynamic formula: 2 × (total_kmers / n_parts) puts the 80% load threshold
@@ -279,7 +291,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
             table_t table(init_sz, 1);
 
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
+            const auto t_count = std::chrono::steady_clock::now();
             const uint64_t ins = count_partition<k, m>(reader, table, token, dbg);
+            const double count_s = count_count_elapsed_s(t_count);
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
             if (dbg) {
@@ -287,11 +301,15 @@ std::pair<uint64_t, uint64_t> count_and_write(
                 dbg->n_overflow  = table.overflow_insert_count();
                 dbg->table_cap   = table.capacity();
                 dbg->n_buckets   = table.bucket_count();
+                dbg->count_s     = count_s;
                 dbg->resize_log  = table.resize_log();
             }
 
+            const auto t_write = std::chrono::steady_clock::now();
             const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const double write_s = count_count_elapsed_s(t_write);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
+            if (dbg) dbg->write_s = write_s;
 
             // Collect per-partition overflow stats.
             const uint64_t ov_cnt = table.overflow_insert_count();
@@ -355,7 +373,7 @@ std::pair<uint64_t, uint64_t> count_and_write(
     if (cfg.debug_stats) {
         // Per-partition table summary.
         std::cerr << "\n[debug] per-partition table stats (first 20):\n";
-        std::cerr << "  part   n_inserted   n_overflow   ov%      table_cap   n_buckets   avg_k/bucket\n";
+        std::cerr << "  part   n_inserted   n_overflow   ov%      table_cap   n_buckets   avg_k/bucket   count_s   write_s\n";
         for (size_t p = 0; p < std::min(n_parts, size_t(20)); ++p) {
             const auto& d = part_infos[p];
             const double ov_pct = d.n_inserted ? 100.0 * d.n_overflow / d.n_inserted : 0.0;
@@ -366,7 +384,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
                       << "  " << std::fixed << std::setprecision(1) << std::setw(6) << ov_pct << "%"
                       << "  " << std::setw(10) << d.table_cap
                       << "  " << std::setw(10) << d.n_buckets
-                      << "  " << std::setprecision(1) << std::setw(12) << avg_kb << "\n";
+                      << "  " << std::setprecision(1) << std::setw(12) << avg_kb
+                      << "  " << std::setprecision(3) << std::setw(8) << d.count_s
+                      << "  " << std::setw(8) << d.write_s << "\n";
         }
         if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
 
@@ -514,8 +534,14 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     std::mutex            out_mutex;
     std::atomic<uint64_t> total_inserted{0}, total_written{0};
 
-    std::mutex            ov_stats_mutex;
-    std::atomic<uint64_t> ov_total{0};
+    std::mutex                                     ov_stats_mutex;
+    std::vector<std::pair<uint32_t, uint64_t>>     ov_top_global;
+    std::atomic<uint64_t>                          ov_total{0};
+
+    std::mutex                                     dbg_mutex;
+    std::unordered_map<uint32_t, uint64_t>         global_coverage_hist;
+    std::vector<PartitionDebugInfo>                part_infos;
+    if (cfg.debug_stats) part_infos.resize(n_parts);
 
     auto worker = [&](size_t tid) {
         typename table_t::Token token;
@@ -534,18 +560,51 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
 
             uint64_t ins;
             {
-                MemoryReader reader(part_bufs[p]);
-                ins = count_partition<k, m, MemoryReader>(reader, table, token);
+                MemoryReader<k> reader(part_bufs[p]);
+                PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
+                const auto t_count = std::chrono::steady_clock::now();
+                ins = count_partition<k, m, MemoryReader<k>>(reader, table, token, dbg);
+                const double count_s = count_count_elapsed_s(t_count);
+                if (dbg) {
+                    dbg->n_inserted = ins;
+                    dbg->n_overflow = table.overflow_insert_count();
+                    dbg->table_cap  = table.capacity();
+                    dbg->n_buckets  = table.bucket_count();
+                    dbg->count_s    = count_s;
+                    dbg->resize_log = table.resize_log();
+                }
             }
             // Release the buffer immediately after counting to cap peak RSS.
             { std::string tmp; part_bufs[p].swap(tmp); }
 
             total_inserted.fetch_add(ins, std::memory_order_relaxed);
 
-            ov_total.fetch_add(table.overflow_insert_count(), std::memory_order_relaxed);
+            const uint64_t ov_cnt = table.overflow_insert_count();
+            if (ov_cnt > 0) {
+                ov_total.fetch_add(ov_cnt, std::memory_order_relaxed);
+                auto top = table.overflow_top_minimizers(20);
+                std::lock_guard<std::mutex> lg(ov_stats_mutex);
+                for (auto& [bin, cnt] : top) {
+                    auto it = std::find_if(ov_top_global.begin(), ov_top_global.end(),
+                                           [bin](const auto& e){ return e.first == bin; });
+                    if (it != ov_top_global.end()) it->second += cnt;
+                    else ov_top_global.emplace_back(bin, cnt);
+                }
+            }
 
+            const auto t_write = std::chrono::steady_clock::now();
             const uint64_t wrt = write_counts<k, m>(table, cfg, chunk, out, out_mutex);
+            const double write_s = count_count_elapsed_s(t_write);
             total_written.fetch_add(wrt, std::memory_order_relaxed);
+            if (cfg.debug_stats) {
+                auto& dbg = part_infos[p];
+                dbg.write_s = write_s;
+                if (!dbg.coverage_hist.empty()) {
+                    std::lock_guard<std::mutex> lg(dbg_mutex);
+                    for (auto& [cov, cnt] : dbg.coverage_hist)
+                        global_coverage_hist[cov] += cnt;
+                }
+            }
         }
     };
 
@@ -556,7 +615,104 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
     for (auto& th : threads) th.join();
 
     if (ov_total.load() > 0)
-        std::cerr << "[overflow] " << ov_total.load() << " k-mers went to overflow\n";
+    {
+        const uint64_t tot_ov = ov_total.load();
+        const uint64_t tot_ins = total_inserted.load();
+        std::cerr << "[overflow] " << tot_ov << " k-mers went to overflow ("
+                  << std::fixed << std::setprecision(2)
+                  << (100.0 * tot_ov / tot_ins) << "% of total)\n";
+
+        std::partial_sort(ov_top_global.begin(),
+                          ov_top_global.begin() + std::min(std::size_t(20), ov_top_global.size()),
+                          ov_top_global.end(),
+                          [](const auto& a, const auto& b){ return a.second > b.second; });
+        if (ov_top_global.size() > 20) ov_top_global.resize(20);
+
+        std::cerr << "[overflow] top minimizer bins (top " << table_t::OV_HIST_BITS_PUBLIC
+                  << " bits of ntHash canonical):\n";
+        std::cerr << "  rank     bin_id (hex)     overflow_kmers\n";
+        for (std::size_t i = 0; i < ov_top_global.size(); ++i)
+            std::cerr << "  " << std::setw(4) << (i + 1)
+                      << "     0x" << std::hex << std::setw(4) << std::setfill('0') << ov_top_global[i].first
+                      << std::dec << std::setfill(' ')
+                      << "     " << ov_top_global[i].second << "\n";
+    }
+
+    if (cfg.debug_stats) {
+        std::cerr << "\n[debug] per-partition table stats (first 20):\n";
+        std::cerr << "  part   n_inserted   n_overflow   ov%      table_cap   n_buckets   avg_k/bucket   count_s   write_s\n";
+        for (size_t p = 0; p < std::min(n_parts, size_t(20)); ++p) {
+            const auto& d = part_infos[p];
+            const double ov_pct = d.n_inserted ? 100.0 * d.n_overflow / d.n_inserted : 0.0;
+            const double avg_kb = d.n_buckets ? static_cast<double>(d.n_inserted) / d.n_buckets : 0.0;
+            std::cerr << "  " << std::setw(5) << p
+                      << "  " << std::setw(11) << d.n_inserted
+                      << "  " << std::setw(11) << d.n_overflow
+                      << "  " << std::fixed << std::setprecision(1) << std::setw(6) << ov_pct << "%"
+                      << "  " << std::setw(10) << d.table_cap
+                      << "  " << std::setw(10) << d.n_buckets
+                      << "  " << std::setprecision(1) << std::setw(12) << avg_kb
+                      << "  " << std::setprecision(3) << std::setw(8) << d.count_s
+                      << "  " << std::setw(8) << d.write_s << "\n";
+        }
+        if (n_parts > 20) std::cerr << "  ... (" << (n_parts - 20) << " more partitions)\n";
+
+        uint64_t total_resize_events = 0;
+        double   total_resize_s = 0.0;
+        uint64_t n_ov_triggered = 0;
+        uint64_t n_load_triggered = 0;
+        size_t   n_parts_resized = 0;
+        for (size_t p = 0; p < n_parts; ++p) {
+            const auto& rlog = part_infos[p].resize_log;
+            if (rlog.empty()) continue;
+            ++n_parts_resized;
+            for (const auto& ev : rlog) {
+                ++total_resize_events;
+                total_resize_s += ev.elapsed_s;
+                n_ov_triggered += ev.overflow_triggered ? 1 : 0;
+                n_load_triggered += ev.overflow_triggered ? 0 : 1;
+            }
+        }
+        std::cerr << "\n[debug] resize summary:\n";
+        std::cerr << "  partitions with resizes : " << n_parts_resized << " / " << n_parts << "\n";
+        std::cerr << "  total resize events     : " << total_resize_events << "\n";
+        std::cerr << "  total resize time       : " << std::fixed << std::setprecision(3) << total_resize_s << "s\n";
+        std::cerr << "  overflow-triggered      : " << n_ov_triggered << "\n";
+        std::cerr << "  load-triggered          : " << n_load_triggered << "\n";
+
+        if (!global_coverage_hist.empty()) {
+            uint64_t total_minimizers = 0, total_kmers_covered = 0;
+            uint32_t max_cov = 0;
+            for (auto& [cov, cnt] : global_coverage_hist) {
+                total_minimizers += cnt;
+                total_kmers_covered += static_cast<uint64_t>(cov) * cnt;
+                if (cov > max_cov) max_cov = cov;
+            }
+            const double avg_cov = total_minimizers ? static_cast<double>(total_kmers_covered) / total_minimizers : 0.0;
+
+            std::cerr << "\n[debug] minimizer coverage (k-mers sharing one minimizer):\n";
+            std::cerr << "  unique minimizers tracked : " << total_minimizers << "\n";
+            std::cerr << "  total k-mers covered      : " << total_kmers_covered << "\n";
+            std::cerr << "  avg k-mers / minimizer    : " << std::fixed << std::setprecision(2) << avg_cov << "\n";
+            std::cerr << "  max k-mers / minimizer    : " << max_cov << "\n";
+
+            const std::string csv_path = cfg.work_dir + "debug_min_coverage.csv";
+            std::ofstream csv(csv_path);
+            if (csv) {
+                csv << "coverage,n_minimizers,total_kmers\n";
+                std::vector<std::pair<uint32_t, uint64_t>> sorted(
+                    global_coverage_hist.begin(), global_coverage_hist.end());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const auto& a, const auto& b){ return a.first < b.first; });
+                for (auto& [cov, cnt] : sorted)
+                    csv << cov << "," << cnt << ","
+                        << (static_cast<uint64_t>(cov) * cnt) << "\n";
+                std::cerr << "[debug] minimizer coverage CSV written to: " << csv_path << "\n";
+            } else {
+                std::cerr << "[debug] warning: could not write CSV to " << csv_path << "\n";
+            }
+        }
+    }
 
     return { total_inserted.load(), total_written.load() };
 }

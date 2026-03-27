@@ -16,15 +16,9 @@ endif()
 # ── Dependencies ───────────────────────────────────────────────────────────────
 
 find_package(Threads REQUIRED)
-
-# Prefer static zlib — avoids GLIBC symbol-versioning issues in conda/spack
-# environments on clusters. Falls back to dynamic if no static lib is found.
-set(ZLIB_USE_STATIC_LIBS ON)
-find_package(ZLIB QUIET)
-if(NOT ZLIB_FOUND)
-    set(ZLIB_USE_STATIC_LIBS OFF)
-    find_package(ZLIB REQUIRED)
-endif()
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(TunaZlibNg)
+tuna_configure_zlib_ng(TUNA_ZLIB_TARGET TUNA_ZLIB_SOURCE)
 
 # L1 cache line size required by kache-hash internals.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -79,4 +73,4 @@ target_include_directories(tuna PRIVATE
     ${CMAKE_SOURCE_DIR}/include/helicase_cpp
 )
 target_compile_options(tuna PRIVATE ${TUNA_COMPILE_FLAGS})
-target_link_libraries(tuna PRIVATE xxhash ZLIB::ZLIB Threads::Threads)
+target_link_libraries(tuna PRIVATE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads)

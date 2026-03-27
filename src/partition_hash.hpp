@@ -82,7 +82,7 @@ void extract_superkmers_from_actg(
         if (new_hash != prev_hash || pos - sk_start >= 255u) {
             const auto sk_len  = static_cast<uint8_t>(sk_end - sk_start);
             const auto min_pos = static_cast<uint8_t>(prev_min_pos - sk_start);
-            writers[pid].append(seq + sk_start, sk_len, min_pos);
+            writers[pid].template append<k>(seq + sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
@@ -96,7 +96,7 @@ void extract_superkmers_from_actg(
 
     const auto sk_len  = static_cast<uint8_t>(sk_end - sk_start);
     const auto min_pos = static_cast<uint8_t>(prev_min_pos - sk_start);
-    writers[pid].append(seq + sk_start, sk_len, min_pos);
+    writers[pid].template append<k>(seq + sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
     ++sk_count;

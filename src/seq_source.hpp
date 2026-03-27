@@ -11,7 +11,7 @@
 //
 // All input types (plain/gz, FASTA/FASTQ) are handled uniformly by helicase SIMD
 // parsers.  Plain files use zero-copy mmap (MmapInput).  GZ files stream through
-// GzInput, a zlib-backed Block-producer that satisfies the helicase input interface.
+// GzInput, a zlib-compatible Block-producer backed by zlib-ng in compat mode.
 //
 // GzInput is also usable directly — e.g. in producer-consumer harnesses that need
 // to decompress and parse independently from SeqSource.
@@ -40,7 +40,7 @@ static constexpr helicase::Config HELICASE_ACTG =
 
 
 // ── GzInput ───────────────────────────────────────────────────────────────────
-// helicase-compatible Block-producer backed by zlib gz decompression.
+// helicase-compatible Block-producer backed by zlib-compatible gz decompression.
 // RANDOM_ACCESS = false; use with FastaParser<CFG, GzInput> / FastqParser<CFG, GzInput>.
 // The constructor eagerly reads the first block so first_byte() is available before
 // any call to next().

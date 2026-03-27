@@ -163,6 +163,26 @@ private:
     // Returns `true` iff `key` matches to the key of the element `e`.
     static constexpr bool key_equals(const flat_t& e, const Kmer<k>& key) { return Streaming_Kmer_Hash_Table::key(e) == key; }
 
+    static constexpr uint64_t mix64(uint64_t x) noexcept
+    {
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x;
+    }
+
+    static constexpr uint64_t bucket_hash(uint64_t x, uint64_t seed) noexcept
+    {
+        return mix64(x + seed);
+    }
+
+    static constexpr uint64_t secondary_bucket_hash(uint64_t x, uint64_t seed) noexcept
+    {
+        return mix64(x ^ seed);
+    }
+
     // Returns the 32-bit equality mask of the vectors `x` and `y`.
     static uint32_t eq_mask(__m256i x, __m256i y);
 
@@ -360,7 +380,7 @@ public:
         // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
         // touched on a checksum match, which is rare at low load factors.
         const auto pf_nt_h = w.minimizer_hash();
-        const auto pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        const auto pf_h = bucket_hash(pf_nt_h, kBucketSeed);
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
@@ -380,7 +400,15 @@ public:
         nt_hash::Roller<l> roller;
         roller.init(buf_l);
         const uint64_t pf_nt_h = roller.canonical();
-        const uint64_t pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        const uint64_t pf_h = bucket_hash(pf_nt_h, kBucketSeed);
+        __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
+    }
+
+    void prefetch_first_kmer(uint64_t first_kmer, const uint8_t min_pos) const
+    {
+        const Kmer<k> kmer(first_kmer);
+        const uint64_t pf_nt_h = Kmer_Window<k, l>::minimizer_nt_hash_from_kmer(kmer, min_pos);
+        const uint64_t pf_h = bucket_hash(pf_nt_h, kBucketSeed);
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
@@ -448,6 +476,19 @@ class Kmer_Window
 
 public:
 
+    static uint64_t minimizer_nt_hash_from_kmer(const Kmer<k>& kmer, uint8_t min_pos)
+    {
+        uint64_t fwd = 0;
+        uint64_t rev = 0;
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint8_t kache_b = static_cast<uint8_t>(kmer.base_at(min_pos + i));
+            const uint8_t nt_b = static_cast<uint8_t>(kache_b ^ (kache_b >> 1));
+            fwd ^= nt_hash::rol64(nt_hash::FWD[nt_b], l - 1 - i);
+            rev ^= nt_hash::rol64(nt_hash::REV[nt_b], i);
+        }
+        return fwd ^ rev;
+    }
+
     // Initializes the k-mer window at the beginning of the ASCII sequence `s`.
     void init(const char* const s)
     {
@@ -495,6 +536,36 @@ public:
         rh.init(buf);
         precomp_nt_h_ = nt_h;
         use_precomp_  = true;
+    }
+
+    void init_first_kmer(uint64_t first_kmer)
+    {
+        v = Directed_Vertex<k>(Kmer<k>(first_kmer));
+        rh.init(v.kmer());
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        char buf[k];
+        for (uint16_t i = 0; i < k; ++i)
+            buf[i] = B2C[static_cast<uint8_t>(v.kmer().base_at(i))];
+        nt_min.reset(buf);
+        use_precomp_ = false;
+    }
+
+    void init_first_kmer_with_hash(uint64_t first_kmer, uint64_t nt_h)
+    {
+        v = Directed_Vertex<k>(Kmer<k>(first_kmer));
+        rh.init(v.kmer());
+        precomp_nt_h_ = nt_h;
+        use_precomp_  = true;
+    }
+
+    uint64_t init_first_kmer_with_min(uint64_t first_kmer, uint8_t min_pos)
+    {
+        const Kmer<k> kmer(first_kmer);
+        v = Directed_Vertex<k>(kmer);
+        rh.init(v.kmer());
+        precomp_nt_h_ = minimizer_nt_hash_from_kmer(kmer, min_pos);
+        use_precomp_  = true;
+        return precomp_nt_h_;
     }
 
     // Fused init: decode k packed bases once, derive ntHash of the l-mer at
@@ -935,7 +1006,7 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = bucket_hash(nt_h, kBucketSeed);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(w.v.canonical(), c, h, m);
@@ -963,7 +1034,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = bucket_hash(nt_h, kBucketSeed);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(std::make_pair(w.v.canonical(), val), c, h, m);
@@ -992,7 +1063,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = bucket_hash(nt_h, kBucketSeed);
 
     tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
@@ -1030,8 +1101,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const flat_t& x, co
     else
     {
         // TODO: get the following hashes from the minimizer iterator (rolling hashes), instead of full-blown xxHash computations.
-        const auto h_1 = XXH3_64bits_withSeed(&h, sizeof(h), 0);
-        const auto h_2 = XXH3_64bits_withSeed(&h, sizeof(h), 1llu << 63);
+        const auto h_1 = secondary_bucket_hash(h, 0x243f6a8885a308d3ULL);
+        const auto h_2 = secondary_bucket_hash(h, 0x9e3779b97f4a7c15ULL);
 
         const auto s_1 = h_1 & idx_mask;
         const auto s_2 = h_2 & idx_mask;
@@ -1113,14 +1184,14 @@ inline void Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert_at_resize(const fla
     static thread_local MinimizerWindow<k, l> tmp_win;
     tmp_win.reset(buf);
     const auto nt_h = tmp_win.hash();
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = bucket_hash(nt_h, kBucketSeed);
 
     const auto b = h & idx_mask;
     if(try_insert_at_resize(x, c, m, b))
         return;
 
-    const auto h_1 = XXH3_64bits_withSeed(&h, sizeof(h), 0);
-    const auto h_2 = XXH3_64bits_withSeed(&h, sizeof(h), 1llu << 63);
+    const auto h_1 = secondary_bucket_hash(h, 0x243f6a8885a308d3ULL);
+    const auto h_2 = secondary_bucket_hash(h, 0x9e3779b97f4a7c15ULL);
     const auto s_1 = h_1 & idx_mask;
     const auto s_2 = h_2 & idx_mask;
     const auto p = std::min(s_1, s_2), q = std::max(s_1, s_2);
@@ -1173,8 +1244,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer<k> key, 
     else
     {
         // TODO: get the following hashes from the minimizer iterator (rolling hashes), instead of full-blown xxHash computations.
-        const auto h_1 = XXH3_64bits_withSeed(&h, sizeof(h), 0);
-        const auto h_2 = XXH3_64bits_withSeed(&h, sizeof(h), 1llu << 63);
+        const auto h_1 = secondary_bucket_hash(h, 0x243f6a8885a308d3ULL);
+        const auto h_2 = secondary_bucket_hash(h, 0x9e3779b97f4a7c15ULL);
 
         const auto p = h_1 & idx_mask;
         const auto q = h_2 & idx_mask;
@@ -1312,7 +1383,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, 
 {
     const auto key = w.v.canonical();
     const auto nt_h = w.minimizer_hash();
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = bucket_hash(nt_h, kBucketSeed);
     const auto idx_mask = cap_ - 1;
 
     const auto b = h & idx_mask;
@@ -1324,8 +1395,8 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::find(const Kmer_Window<k, 
         return null_val;
 
     // TODO: get the following hashes from the minimizer iterator (rolling hashes), instead of full-blown xxHash computations.
-    const auto h_1 = XXH3_64bits_withSeed(&h, sizeof(h), 0);
-    const auto h_2 = XXH3_64bits_withSeed(&h, sizeof(h), 1llu << 63);
+    const auto h_1 = secondary_bucket_hash(h, 0x243f6a8885a308d3ULL);
+    const auto h_2 = secondary_bucket_hash(h, 0x9e3779b97f4a7c15ULL);
 
     const auto p = h_1 & idx_mask;
     const auto q = h_2 & idx_mask;

@@ -38,21 +38,21 @@ Partitions are processed in parallel across threads (up to `-n` partitions at a 
 - **Platform: Linux or macOS, x86\_64 only** (kache-hash uses x86 SIMD intrinsics)
 - C++20 compiler: [GCC](https://gcc.gnu.org/) >= 9.1 or [Clang](https://clang.llvm.org) >= 9.0
 - [CMake](https://cmake.org/) >= 3.17
-- [zlib](https://zlib.net/)
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) in zlib compatibility mode
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt-get install build-essential cmake zlib1g-dev
+sudo apt-get install build-essential cmake pkg-config zlib-ng-dev
 ```
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install gcc-c++ cmake zlib-devel
+sudo dnf install gcc-c++ cmake pkgconf-pkg-config zlib-ng-compat-devel
 ```
 
 **macOS:**
 ```bash
-brew install llvm cmake zlib
+brew install llvm cmake pkg-config zlib-ng
 ```
 
 ---
@@ -68,6 +68,11 @@ make -j$(nproc)
 ```
 
 The `tuna` binary will be at `build/tuna`.
+
+`tuna` now prefers a system `zlib-ng` compatibility build. If one is not found,
+the CMake configure step downloads the latest `zlib-ng` GitHub release and
+builds it in-tree automatically. To disable that fallback, configure with
+`-DTUNA_ALLOW_ZLIB_NG_DOWNLOAD=OFF`.
 
 <details>
 <summary><strong>Compile-time options</strong></summary>
