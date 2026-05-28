@@ -1,17 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# bench_compare.sh — k-mer counter benchmark: tuna · KMC · FastK · KFC
-# Scenario : count + text dump, k=31, single-genome inputs
-# Datasets : 1000 E. coli genomes, 10 human genomes (from a file-of-files)
+# bench_default.sh — k-mer counter benchmark: tuna · KMC · FastK · KFC
+# Scenario : count + text dump, k=31, one genome per species
+# Datasets : first genome from ECOLI_FOF, first genome from HUMAN_FOF
 # Threads  : 1, 4, 8, 16   —   RAM budget: 256 GB
-#
-# Each genome is counted individually by all 4 tools.
-# To avoid systematic OS page-cache bias (first tool always sees cold data),
-# the tool order rotates:
-#   E. coli : rotates every 250 files  (4 groups × 250 = 1000)
-#   human   : rotates every 2 files    (5 groups × 2 = 10)
-# With 4 tools the rotation cycles in 4 steps, so each tool starts first
-# equally often across the dataset.
 #
 # Notes on tool differences:
 #   tuna  : single command, writes TSV directly (no dump step)
@@ -48,7 +40,6 @@ K=31
 RAM_GB=256
 THREADS_LIST=(1 4 8 16)
 
-# Tool rotation order — do not change (drives the cycle logic below)
 TOOLS=(tuna kmc fastk kfc)
 
 # =============================================================================
@@ -66,10 +57,10 @@ for var in ECOLI_FOF HUMAN_FOF; do
 done
 [[ "$err" -eq 1 ]] && exit 1
 
-ecoli_count=$(wc -l < "$ECOLI_FOF")
-human_count=$(wc -l < "$HUMAN_FOF")
-[[ "$ecoli_count" -lt 1000 ]] && echo "[warn] ECOLI_FOF has $ecoli_count lines (expected 1000)"
-[[ "$human_count"  -lt 10   ]] && echo "[warn] HUMAN_FOF has $human_count lines (expected 10)"
+ECOLI_GENOME=$(head -1 "$ECOLI_FOF")
+HUMAN_GENOME=$(head -1 "$HUMAN_FOF")
+[[ ! -f "$ECOLI_GENOME" ]] && { echo "[error] E. coli genome not found: $ECOLI_GENOME"; exit 1; }
+[[ ! -f "$HUMAN_GENOME" ]] && { echo "[error] Human genome not found: $HUMAN_GENOME"; exit 1; }
 
 # =============================================================================
 # Directory setup
@@ -87,10 +78,9 @@ RESULTS="$WORKDIR/results.log"
     echo "# FASTK=$FASTK  TABEX=$TABEX"
     echo "# KFC=$KFC"
     echo "# WORKDIR=$WORKDIR"
-    echo "# ECOLI_FOF=$ECOLI_FOF  ($ecoli_count genomes)"
-    echo "# HUMAN_FOF=$HUMAN_FOF  ($human_count genomes)"
+    echo "# ECOLI=$ECOLI_GENOME"
+    echo "# HUMAN=$HUMAN_GENOME"
     echo "# K=$K  RAM=${RAM_GB}GB  THREADS=${THREADS_LIST[*]}"
-    echo "# Tool rotation: E. coli every 250 files, human every 2 files"
 } > "$RESULTS"
 
 # =============================================================================
@@ -110,10 +100,9 @@ fastk_link_path() {
 }
 
 echo "[setup] Creating FastK-compatible symlinks..."
-while read -r f; do
-    link=$(fastk_link_path "$f")
-    ln -sf "$f" "$link"
-done < <(sort -u "$ECOLI_FOF" "$HUMAN_FOF")
+for f in "$ECOLI_GENOME" "$HUMAN_GENOME"; do
+    ln -sf "$f" "$(fastk_link_path "$f")"
+done
 
 # =============================================================================
 # Helper: write a labelled header to results.log
@@ -204,71 +193,39 @@ _run_kfc() {
 # Dispatcher: run one tool on one genome and clean up
 # =============================================================================
 run_one() {
-    local tool="$1" dataset="$2" gen_idx="$3" genome_file="$4" threads="$5"
-    local outdir="$WORKDIR/$tool/runs/${dataset}_g${gen_idx}_t${threads}"
+    local tool="$1" dataset="$2" genome_file="$3" threads="$4"
+    local outdir="$WORKDIR/$tool/runs/${dataset}_t${threads}"
     mkdir -p "$outdir"
 
-    log_header "TOOL=$tool DS=$dataset GEN=$gen_idx FILE=$(basename "$genome_file") T=$threads"
+    log_header "TOOL=$tool DS=$dataset FILE=$(basename "$genome_file") T=$threads"
 
     case "$tool" in
         tuna)  _run_tuna  "$genome_file" "$outdir" "$threads" ;;
         kmc)   _run_kmc   "$genome_file" "$outdir" "$threads" ;;
         fastk) _run_fastk "$genome_file" "$outdir" "$threads" ;;
         kfc)   _run_kfc   "$genome_file" "$outdir" "$threads" ;;
-    esac || echo "[warn] $tool failed: $dataset gen $gen_idx t=$threads" | tee -a "$RESULTS"
+    esac || echo "[warn] $tool failed: $dataset t=$threads" | tee -a "$RESULTS"
 
     rm -rf "$outdir"
 }
 
 # =============================================================================
-# Main benchmark loop
-#
-# Outer loop : thread counts (1, 4, 8, 16)
-# Inner loop : genomes from FOF, one at a time
-#   For each genome, all 4 tools run in the current rotated order.
-#   Tool order rotates every CYCLE_SIZE files:
-#     E. coli : CYCLE_SIZE=250  → groups 1-250, 251-500, 501-750, 751-1000
-#     human   : CYCLE_SIZE=2    → pairs 1-2, 3-4, 5-6, 7-8, 9-10
-#
-# Rotation:
-#   group 0 → [tuna, kmc, fastk, kfc]
-#   group 1 → [kmc, fastk, kfc, tuna]
-#   group 2 → [fastk, kfc, tuna, kmc]
-#   group 3 → [kfc, tuna, kmc, fastk]
+# Main loop: for each thread count, run all tools on each genome
 # =============================================================================
-echo "[bench] Starting benchmark — $(date)"
-n_tools=${#TOOLS[@]}
+echo "[bench] Starting — $(date)"
+echo "[bench] E. coli: $(basename "$ECOLI_GENOME")"
+echo "[bench] Human  : $(basename "$HUMAN_GENOME")"
 
 for threads in "${THREADS_LIST[@]}"; do
-    echo "[bench] ── threads=$threads ───────────────────────────────"
-
-    # ── E. coli: 1000 genomes, rotate tool order every 250 ──
-    echo "[bench]   E. coli (1000 genomes, cycle=250)"
-    gen_idx=0
-    while IFS= read -r genome_file; do
-        gen_idx=$(( gen_idx + 1 ))
-        rotation=$(( (gen_idx - 1) / 250 % n_tools ))
-        [[ $(( (gen_idx - 1) % 50 )) -eq 0 ]] && \
-            echo "[bench]     ecoli gen $gen_idx/1000 rotation=$rotation t=$threads — $(date +%H:%M:%S)"
-        for (( i=0; i<n_tools; i++ )); do
-            tool_idx=$(( (i + rotation) % n_tools ))
-            run_one "${TOOLS[$tool_idx]}" ecoli "$gen_idx" "$genome_file" "$threads"
-        done
-    done < "$ECOLI_FOF"
-
-    # ── human: 10 genomes, rotate tool order every 2 ──
-    echo "[bench]   human (10 genomes, cycle=2)"
-    gen_idx=0
-    while IFS= read -r genome_file; do
-        gen_idx=$(( gen_idx + 1 ))
-        rotation=$(( (gen_idx - 1) / 2 % n_tools ))
-        echo "[bench]     human gen $gen_idx/10 rotation=$rotation t=$threads — $(date +%H:%M:%S)"
-        for (( i=0; i<n_tools; i++ )); do
-            tool_idx=$(( (i + rotation) % n_tools ))
-            run_one "${TOOLS[$tool_idx]}" human "$gen_idx" "$genome_file" "$threads"
-        done
-    done < "$HUMAN_FOF"
-
+    echo "[bench] ── threads=$threads ──"
+    for tool in "${TOOLS[@]}"; do
+        echo "[bench]   $tool ecoli t=$threads — $(date +%H:%M:%S)"
+        run_one "$tool" ecoli "$ECOLI_GENOME" "$threads"
+    done
+    for tool in "${TOOLS[@]}"; do
+        echo "[bench]   $tool human t=$threads — $(date +%H:%M:%S)"
+        run_one "$tool" human "$HUMAN_GENOME" "$threads"
+    done
 done
 
 echo "" >> "$RESULTS"
