@@ -141,7 +141,7 @@ _run_kmc() {
     /usr/bin/time -v bash -c "
         set -e
         \"$KMC\" \
-            -k${K} -ci1 -fm -m${RAM_GB} -hp -t${threads} \
+            -k${K} -ci1 -cs4294967295 -fm -m${RAM_GB} -hp -t${threads} \
             \"$genome_file\" \
             \"$outdir/out\" \
             \"$outdir/tmp\" \
