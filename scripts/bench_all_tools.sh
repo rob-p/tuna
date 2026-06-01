@@ -38,7 +38,7 @@ HUMAN_FOF="/WORKS/vlevallois/data/dataset_genome_human/fof_10.list"      # absol
 
 K=31
 RAM_GB=256
-THREADS_LIST=(1 4 8 16)
+THREADS_LIST=(1 2 4 6 8 10 16 22 28 32)
 
 TOOLS=(tuna kmc fastk kfc)
 
