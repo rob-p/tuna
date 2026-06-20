@@ -29,6 +29,7 @@
 #include <charconv>
 #include <string_view>
 
+#include <ankerl/unordered_dense.h>
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
 
@@ -229,7 +230,7 @@ uint64_t count_partition_mem_aggregated(
         }
     };
 
-    std::unordered_map<std::string_view, uint32_t, RecordHash> multiplicities;
+    ankerl::unordered_dense::map<std::string_view, uint32_t, RecordHash> multiplicities;
     multiplicities.reserve(std::max<size_t>(1024, data.size() / 8));
 
     const char* cur = data.data();
