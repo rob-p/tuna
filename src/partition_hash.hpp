@@ -653,6 +653,184 @@ PartitionStats partition_kmers_mem_impl(
             return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
     }
 
+    // Few large plain files: split parsed records/chunks across all worker
+    // threads instead of assigning whole files to workers.  The producer keeps
+    // each mmap-backed parser alive until consumers have drained all views for
+    // that file.
+    if (n_files > 1 && n_files <= n_threads_req && n_threads_req > 1) {
+        bool all_plain = true;
+        for (const auto& input_path : cfg.input_files) {
+            if (input_path.size() > 3 &&
+                input_path.compare(input_path.size() - 3, 3, ".gz") == 0) {
+                all_plain = false;
+                break;
+            }
+        }
+
+        if (all_plain) {
+            using Batch = std::vector<std::string_view>;
+            constexpr size_t MAX_QUEUE  = 32;
+            constexpr size_t MAX_BATCH_ITEMS = 8192;
+            constexpr size_t TARGET_BATCH_BASES = 1u << 20;
+            constexpr size_t TARGET_CHUNK_BASES = 1u << 20;
+            const size_t n_consumers = n_threads_req - 1;
+
+            std::deque<Batch>       queue;
+            std::mutex              q_mutex;
+            std::condition_variable q_cv;
+            bool                    producer_done = false;
+            size_t                  active_batches = 0;
+            std::exception_ptr      producer_error = nullptr;
+            std::atomic<bool>       stop{false};
+            std::exception_ptr      consumer_error = nullptr;
+            std::mutex              consumer_error_mutex;
+            std::vector<std::mutex> buf_mutexes(n_parts);
+            std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+            auto producer_fn = [&]() {
+                auto push_batch = [&](Batch& batch, size_t& batch_bases) {
+                    if (batch.empty()) return;
+                    {
+                        std::unique_lock<std::mutex> lk(q_mutex);
+                        q_cv.wait(lk, [&]{
+                            return queue.size() < MAX_QUEUE ||
+                                   stop.load(std::memory_order_relaxed);
+                        });
+                        if (stop.load(std::memory_order_relaxed)) return;
+                        queue.push_back(std::move(batch));
+                    }
+                    q_cv.notify_one();
+                    batch = Batch{};
+                    batch_bases = 0;
+                };
+
+                auto wait_until_consumed = [&]() {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&]{
+                        return (queue.empty() && active_batches == 0) ||
+                               stop.load(std::memory_order_relaxed);
+                    });
+                };
+
+                auto feed = [&](auto& parser) {
+                    Batch batch;
+                    size_t batch_bases = 0;
+                    auto add_chunk = [&](const char* ptr, size_t len) {
+                        if (len < k) return;
+                        const size_t step = TARGET_CHUNK_BASES > k
+                            ? TARGET_CHUNK_BASES - (k - 1)
+                            : TARGET_CHUNK_BASES;
+                        for (size_t off = 0; off < len; ) {
+                            const size_t sub_len = std::min(TARGET_CHUNK_BASES, len - off);
+                            batch.emplace_back(ptr + off, sub_len);
+                            batch_bases += sub_len;
+                            if (batch_bases >= TARGET_BATCH_BASES ||
+                                batch.size() >= MAX_BATCH_ITEMS)
+                                push_batch(batch, batch_bases);
+                            if (off + sub_len >= len) break;
+                            off += step;
+                        }
+                    };
+
+                    while (!stop.load(std::memory_order_relaxed) && parser.next()) {
+                        auto [ptr, len] = parser.get_dna_raw();
+                        add_chunk(ptr, len);
+                    }
+                    if (!stop.load(std::memory_order_relaxed))
+                        push_batch(batch, batch_bases);
+                    wait_until_consumed();
+                };
+
+                try {
+                    for (const auto& input_path : cfg.input_files) {
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        helicase::MmapInput inp(input_path);
+                        if (inp.first_byte() == '@') {
+                            helicase::FastqParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
+                            feed(p);
+                        } else {
+                            helicase::FastaParser<HELICASE_ACTG, helicase::MmapInput> p(std::move(inp));
+                            feed(p);
+                        }
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        producer_done = true;
+                    }
+                    q_cv.notify_all();
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        producer_error = std::current_exception();
+                        producer_done = true;
+                    }
+                    stop.store(true, std::memory_order_relaxed);
+                    q_cv.notify_all();
+                }
+            };
+
+            auto consumer_fn = [&]() {
+                try {
+                    const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+                    MinimizerWindow<k, m>        min_it;
+                    std::vector<SuperkmerWriter<k, m>>  writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+                    std::vector<uint8_t>         kache_buf;
+                    uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+                    auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                        if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                    };
+                    while (true) {
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        Batch batch;
+                        {
+                            std::unique_lock<std::mutex> lk(q_mutex);
+                            q_cv.wait(lk, [&]{ return !queue.empty() || producer_done; });
+                            if (queue.empty()) break;
+                            batch = std::move(queue.front());
+                            queue.pop_front();
+                            ++active_batches;
+                        }
+                        q_cv.notify_all();
+                        for (const auto chunk : batch) {
+                            if (stop.load(std::memory_order_relaxed)) break;
+                            extract_superkmers_from_actg<k, m>(
+                                chunk.data(), chunk.size(), partition_fn,
+                                min_it, writers, local_kmers, local_superkmers, flush_fn, kache_buf);
+                            ++local_seqs;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            --active_batches;
+                        }
+                        q_cv.notify_all();
+                    }
+                    for (size_t p = 0; p < n_parts; ++p)
+                        writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+                    total_seqs       .fetch_add(local_seqs,        std::memory_order_relaxed);
+                    total_kmers      .fetch_add(local_kmers,       std::memory_order_relaxed);
+                    total_superkmers .fetch_add(local_superkmers,  std::memory_order_relaxed);
+                } catch (...) {
+                    {
+                        std::lock_guard<std::mutex> lk(consumer_error_mutex);
+                        if (!consumer_error) consumer_error = std::current_exception();
+                    }
+                    stop.store(true, std::memory_order_relaxed);
+                    q_cv.notify_all();
+                }
+            };
+
+            std::vector<std::thread> threads;
+            threads.reserve(n_threads_req);
+            threads.emplace_back(producer_fn);
+            for (size_t t = 0; t < n_consumers; ++t)
+                threads.emplace_back(consumer_fn);
+            for (auto& th : threads) th.join();
+            if (producer_error) std::rethrow_exception(producer_error);
+            if (consumer_error) std::rethrow_exception(consumer_error);
+            return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+        }
+    }
+
     // Multi-file: file-level work-stealing.
     std::atomic<size_t>     next_file{0};
     std::vector<std::mutex> buf_mutexes(n_parts);
