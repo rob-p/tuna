@@ -145,7 +145,7 @@ int run(const Config& cfg)
         const auto t2 = std::chrono::steady_clock::now();
 
         std::ofstream tsv_out;
-        if (!cfg.output_kff) {
+        if (!cfg.output_kff && !cfg.count_only) {
             tsv_out.open(cfg.output_file);
             if (!tsv_out) {
                 std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -153,15 +153,17 @@ int run(const Config& cfg)
             }
         }
 
-        const auto [total_inserted, total_written] = cfg.output_kff
+        const auto [total_inserted, total_written] = cfg.count_only
+            ? count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, nullptr)
+            : (cfg.output_kff
             ? [&]() {
                 KffOutput kff_out(cfg.output_file, cfg.k);
                 auto r = count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, nullptr, &kff_out);
                 kff_out.close();
                 return r;
               }()
-            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr);
-        if (!cfg.output_kff && !tsv_out) {
+            : count_and_write_mem<k, m>(cfg, stats.kmers, part_bufs, &tsv_out, nullptr));
+        if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
             std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
             return 1;
         }
@@ -226,7 +228,7 @@ int run(const Config& cfg)
     const auto t2 = std::chrono::steady_clock::now();
 
     std::ofstream tsv_out;
-    if (!cfg.output_kff) {
+    if (!cfg.output_kff && !cfg.count_only) {
         tsv_out.open(cfg.output_file);
         if (!tsv_out) {
             std::cerr << "tuna: error: cannot open output file: " << cfg.output_file << "\n";
@@ -234,15 +236,17 @@ int run(const Config& cfg)
         }
     }
 
-    const auto [total_inserted, total_written] = cfg.output_kff
+    const auto [total_inserted, total_written] = cfg.count_only
+        ? count_and_write<k, m>(cfg, stats.kmers, nullptr, nullptr)
+        : (cfg.output_kff
         ? [&]() {
             KffOutput kff_out(cfg.output_file, cfg.k);
             auto r = count_and_write<k, m>(cfg, stats.kmers, nullptr, &kff_out);
             kff_out.close();
             return r;
           }()
-        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr);
-    if (!cfg.output_kff && !tsv_out) {
+        : count_and_write<k, m>(cfg, stats.kmers, &tsv_out, nullptr));
+    if (!cfg.output_kff && !cfg.count_only && !tsv_out) {
         std::cerr << "tuna: error: failed while writing output file: " << cfg.output_file << "\n";
         return 1;
     }

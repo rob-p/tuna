@@ -209,6 +209,22 @@ uint64_t write_counts(
     return written;
 }
 
+template <uint16_t k, uint16_t m, bool mt_ = false>
+uint64_t count_output_kmers(
+    kache_hash::Streaming_Kmer_Hash_Table<k, mt_, uint32_t, m>& table,
+    const Config& cfg)
+{
+    if (cfg.ci <= 1 && cfg.cx == std::numeric_limits<uint64_t>::max())
+        return static_cast<uint64_t>(table.size());
+
+    uint64_t written = 0;
+    table.for_each([&](const auto& entry) {
+        const uint64_t cnt = entry.second;
+        if (cnt >= cfg.ci && cnt <= cfg.cx) ++written;
+    });
+    return written;
+}
+
 
 // ─── KFF output brick ─────────────────────────────────────────────────────────
 //
@@ -789,9 +805,11 @@ std::pair<uint64_t, uint64_t> count_and_write(
                     dbg->resize_log  = table.resize_log();
                 }
 
-                const uint64_t wrt = kff_out
-                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+                const uint64_t wrt = cfg.count_only
+                    ? count_output_kmers<k, m>(table, cfg)
+                    : (kff_out
+                        ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                        : write_counts<k, m>(table, cfg, chunk, *out, out_mutex));
                 total_written.fetch_add(wrt, std::memory_order_relaxed);
 
                 // Collect per-partition overflow stats.
@@ -941,9 +959,11 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
                 dbg->resize_log  = table.resize_log();
             }
 
-            const uint64_t wrt = kff_out
-                ? write_counts_kff<k, m>(table, cfg, *kff_out)
-                : write_counts<k, m>(table, cfg, chunk, *out, out_mutex);
+            const uint64_t wrt = cfg.count_only
+                ? count_output_kmers<k, m>(table, cfg)
+                : (kff_out
+                    ? write_counts_kff<k, m>(table, cfg, *kff_out)
+                    : write_counts<k, m>(table, cfg, chunk, *out, out_mutex));
             total_written.fetch_add(wrt, std::memory_order_relaxed);
         }
     };

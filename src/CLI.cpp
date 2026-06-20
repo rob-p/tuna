@@ -55,6 +55,7 @@ void print_usage(const char* prog)
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
+        "  -co         count only: skip output writing after k-mer counting\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -kff        write output in KFF binary format (auto-detected from .kff extension)\n"
@@ -160,6 +161,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.keep_tmp = true;
         } else if (arg == "-tp") {
             cfg.partition_only = true;
+        } else if (arg == "-co") {
+            cfg.count_only = true;
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "tuna: error: unknown option: " << arg << "\n";
             return false;

@@ -161,11 +161,15 @@ run_tuna() {
     local work_d="$RUN_DIR/${tag}.tuna_work"
     mkdir -p "$work_d"
     local part_args=()
+    local count_args=()
     if [[ -n "$PARTS" ]]; then
         part_args=(-n "$PARTS")
     fi
+    if [[ "$out_path" == "/dev/null" ]]; then
+        count_args=(-co)
+    fi
     /usr/bin/time -v -o "$time_f" \
-        "$TUNA" -k "$K" -m "$M" -t "$THREADS" "${part_args[@]}" -hp -w "$work_d" \
+        "$TUNA" -k "$K" -m "$M" -t "$THREADS" "${part_args[@]}" "${count_args[@]}" -hp -w "$work_d" \
         "$input_arg" "$out_path" \
         2>"$stderr_f"
     rm -rf "$work_d"

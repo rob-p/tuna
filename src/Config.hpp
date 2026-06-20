@@ -20,6 +20,7 @@ struct Config {
     bool         hide_progress  = false;
     bool         keep_tmp      = false; // skip cleanup of partition files (useful for benchmarking)
     bool         partition_only = false; // exit after phase 1 (for benchmarking partition speed)
+    bool         count_only    = false; // count k-mers but skip output writing
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
