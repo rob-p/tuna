@@ -27,6 +27,7 @@
 #include <exception>
 #include <stdexcept>
 #include <charconv>
+#include <string_view>
 
 #include "kache-hash/Streaming_Kmer_Hash_Table.hpp"
 
@@ -163,6 +164,98 @@ uint64_t count_partition(
         // Convert per-minimizer k-mer counts to a coverage histogram.
         for (auto& [mh, cnt] : min_kmer_count)
             dbg->coverage_hist[cnt]++;
+    }
+
+    return inserted;
+}
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_superkmer_record(
+    const uint8_t*                                                        packed,
+    size_t                                                                len,
+    sk_hdr_t<k, m>                                                        min_pos,
+    uint32_t                                                              multiplicity,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+{
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr hdr_t NO_MIN = sk_no_min<k, m>;
+
+    if (len < k || multiplicity == 0) return 0;
+
+    auto inc = [multiplicity](uint32_t v) { return v + multiplicity; };
+    uint64_t inserted = 0;
+
+    kache_hash::Kmer_Window<k, m> win;
+    if (min_pos != NO_MIN) {
+        win.init_packed_with_min(packed, min_pos);
+        table.prefetch(win);
+    } else {
+        win.init_packed(packed);
+        table.prefetch(win);
+    }
+
+    table.upsert(win, inc, multiplicity, token);
+    inserted += multiplicity;
+
+    const uint8_t* byte_ptr = packed + (k >> 2);
+    int shift = static_cast<int>(6u - 2u * (k & 3u));
+    for (size_t i = k; i < len; ++i) {
+        const auto b = static_cast<kache_hash::DNA::Base>((*byte_ptr >> shift) & 3u);
+        shift -= 2;
+        if (shift < 0) { shift = 6; ++byte_ptr; }
+        win.advance(b);
+        table.upsert(win, inc, multiplicity, token);
+        inserted += multiplicity;
+    }
+
+    return inserted;
+}
+
+
+template <uint16_t k, uint16_t m>
+uint64_t count_partition_mem_aggregated(
+    const std::string&                                                    data,
+    kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>&         table,
+    typename kache_hash::Streaming_Kmer_Hash_Table<k, false, uint32_t, m>::Token& token)
+{
+    using hdr_t = sk_hdr_t<k, m>;
+    static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+
+    struct RecordHash {
+        size_t operator()(std::string_view s) const noexcept {
+            return static_cast<size_t>(XXH3_64bits(s.data(), s.size()));
+        }
+    };
+
+    std::unordered_map<std::string_view, uint32_t, RecordHash> multiplicities;
+    multiplicities.reserve(std::max<size_t>(1024, data.size() / 8));
+
+    const char* cur = data.data();
+    const char* end = data.data() + data.size();
+    while (cur + static_cast<ptrdiff_t>(HDR_BYTES) <= end) {
+        const char* rec = cur;
+        hdr_t len, mp;
+        std::memcpy(&len, cur,                 sizeof(hdr_t));
+        std::memcpy(&mp,  cur + sizeof(hdr_t), sizeof(hdr_t));
+        (void)mp;
+        if (len == 0) break;
+        cur += HDR_BYTES;
+        const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
+        if (cur + static_cast<ptrdiff_t>(packed_bytes) > end) break;
+        cur += packed_bytes;
+        ++multiplicities[std::string_view(rec, static_cast<size_t>(cur - rec))];
+    }
+
+    uint64_t inserted = 0;
+    for (const auto& [record, multiplicity] : multiplicities) {
+        hdr_t len, mp;
+        std::memcpy(&len, record.data(),                 sizeof(hdr_t));
+        std::memcpy(&mp,  record.data() + sizeof(hdr_t), sizeof(hdr_t));
+        const auto* packed = reinterpret_cast<const uint8_t*>(record.data() + HDR_BYTES);
+        inserted += count_superkmer_record<k, m>(
+            packed, static_cast<size_t>(len), mp, multiplicity, table, token);
     }
 
     return inserted;
@@ -930,7 +1023,9 @@ std::pair<uint64_t, uint64_t> count_and_write_mem(
             PartitionDebugInfo* dbg = cfg.debug_stats ? &part_infos[p] : nullptr;
 
             uint64_t ins;
-            {
+            if (!cfg.debug_stats) {
+                ins = count_partition_mem_aggregated<k, m>(part_bufs[p], table, token);
+            } else {
                 MemoryReader<k, m> reader(part_bufs[p]);
                 ins = count_partition<k, m, MemoryReader<k, m>>(reader, table, token, dbg);
             }
