@@ -64,7 +64,8 @@ struct PartitionDebugInfo {
 //
 // Drains a superkmer reader into the caller-provided hash table (mt_=false).
 // The stored min_pos byte lets Phase 2 init the bucket hash in O(m) rather than
-// O(k), and a 1-ahead prefetch_packed hides the ~40 ns LLC miss per superkmer.
+// O(k).  After each superkmer window is initialized, we prefetch the destination
+// bucket from the already-computed minimizer hash.
 //
 // Returns the total number of k-mer insertions (with multiplicity).
 
@@ -83,10 +84,6 @@ uint64_t count_partition(
 
     // Per-minimizer k-mer count (only allocated when debug is requested).
     std::unordered_map<uint64_t, uint32_t> min_kmer_count;
-
-    // 1-ahead prefetch: issue prefetch_packed for superkmer N+1 before processing N
-    // to hide the ~40 ns LLC miss behind N's processing time.
-    // min_pos == NO_MIN (sentinel): falls back to prefetch-after-init.
 
     // ── Prime the pump ────────────────────────────────────────────────────────
     if (!reader.next()) return inserted;
@@ -111,10 +108,6 @@ uint64_t count_partition(
         const uint8_t* nxt_packed  = reader.packed_data();  // packed bases of next superkmer (prefetch target)
         const size_t   nxt_len     = reader.size();
         const hdr_t    nxt_min_pos = reader.min_pos();
-
-        // Issue prefetch for NEXT bucket BEFORE processing CURRENT superkmer.
-        if (nxt_len >= k && nxt_min_pos != NO_MIN)
-            table.prefetch_packed(nxt_packed, nxt_min_pos);
 
         // Process CURRENT superkmer.
         if (cur_len >= k) {
@@ -142,6 +135,7 @@ uint64_t count_partition(
             if (cur_min_pos != NO_MIN) {
                 const uint64_t mh = win.init_packed_with_min(cur_packed, cur_min_pos);
                 if (dbg) min_kmer_count[mh] += static_cast<uint32_t>(cur_len - k + 1);
+                table.prefetch(win);
             } else {
                 win.init_packed(cur_packed);
                 table.prefetch(win);  // NO_MIN fallback: prefetch after init

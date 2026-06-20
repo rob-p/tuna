@@ -440,7 +440,7 @@ public:
         // The SIMD checksum scan always hits M[b] first; T[b*B+j] is only
         // touched on a checksum match, which is rare at low load factors.
         const auto pf_nt_h = w.minimizer_hash();
-        const auto pf_h = XXH3_64bits_withSeed(&pf_nt_h, sizeof(pf_nt_h), kBucketSeed);
+        const auto pf_h = w.minimizer_bucket_hash(pf_nt_h);
         __builtin_prefetch(&M[pf_h & (cap_ - 1)], 0, 3);
     }
 
@@ -524,7 +524,15 @@ class Kmer_Window
     Rolling_Hash<k, true> rh;
     MinimizerWindow<k, l> nt_min;
     uint64_t              precomp_nt_h_ = 0;
+    uint64_t              precomp_bucket_h_ = 0;
     bool                  use_precomp_  = false;
+
+    static constexpr uint64_t kBucketSeed = 0x9e3779b97f4a7c15ULL;
+
+    static uint64_t bucket_hash_from_minimizer(uint64_t nt_h)
+    {
+        return XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    }
 
 public:
 
@@ -558,6 +566,7 @@ public:
         v = Directed_Vertex<k>(Kmer<k>(s));
         rh.init(s);
         precomp_nt_h_ = nt_h;
+        precomp_bucket_h_ = bucket_hash_from_minimizer(nt_h);
         use_precomp_  = true;
     }
 
@@ -574,6 +583,7 @@ public:
         v = Directed_Vertex<k>(Kmer<k>(buf));
         rh.init(buf);
         precomp_nt_h_ = nt_h;
+        precomp_bucket_h_ = bucket_hash_from_minimizer(nt_h);
         use_precomp_  = true;
     }
 
@@ -593,6 +603,7 @@ public:
         nt_hash::Roller<l> roller;
         roller.init(buf + min_pos);
         precomp_nt_h_ = roller.canonical();
+        precomp_bucket_h_ = bucket_hash_from_minimizer(precomp_nt_h_);
         use_precomp_  = true;
         return precomp_nt_h_;
     }
@@ -632,6 +643,11 @@ public:
     // Returns the ntHash of the l-minimizer of the current k-mer.
     // Returns precomputed hash if provided at init.
     auto minimizer_hash() const { return use_precomp_ ? precomp_nt_h_ : nt_min.hash(); }
+
+    uint64_t minimizer_bucket_hash(uint64_t nt_h) const
+    {
+        return use_precomp_ ? precomp_bucket_h_ : bucket_hash_from_minimizer(nt_h);
+    }
 
     // Same as minimizer_hash() with min_coord output (used by upsert/insert).
     uint64_t minimizer_nt_hash(uint8_t& m) const
@@ -1022,7 +1038,7 @@ inline bool Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = w.minimizer_bucket_hash(nt_h);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(w.v.canonical(), c, h, m);
@@ -1061,7 +1077,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::insert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = w.minimizer_bucket_hash(nt_h);
 
     if constexpr(mt_)   table_lock.lock_shared(token.id);
     const auto r = insert(std::make_pair(w.v.canonical(), val), c, h, m);
@@ -1101,7 +1117,7 @@ inline auto Streaming_Kmer_Hash_Table<k, mt_, T_, l>::upsert(const Kmer_Window<k
     const auto c = std::max(w.rh.template checksum<8>(), uint64_t(1));  // Avoiding checksum 0 by overloading checksum 1.
     const auto nt_h = w.minimizer_nt_hash(m);
     m = w.v.in_canonical_form() ? m : (m ^ min_orientation_mask);
-    const auto h = XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
+    const auto h = w.minimizer_bucket_hash(nt_h);
 
     tl_ov_happened_ = false;
     if constexpr(mt_)   table_lock.lock_shared(token.id);
