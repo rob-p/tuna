@@ -18,6 +18,7 @@
 
 #include "nt_hash.hpp"
 
+#include <array>
 #include <cstdint>
 #include <limits>
 
@@ -128,9 +129,43 @@ public:
         reset_windows();
     }
 
+    template <typename GetNtBase>
+    void reset_nt(GetNtBase&& get_nt) noexcept {
+        std::array<uint8_t, m> bases{};
+        lmer_ = 0;
+        for (uint16_t i = 0; i < m; ++i) {
+            bases[i] = get_nt(i) & 3u;
+            lmer_ |= (uint64_t(bases[i]) << (2 * (m - 1 - i)));
+        }
+
+        std::array<char, m> buf{};
+        static constexpr char B2C[4] = {'A', 'C', 'T', 'G'};
+        for (uint16_t i = 0; i < m; ++i)
+            buf[i] = B2C[bases[i]];
+        hasher_.init(buf.data());
+
+        pivot    = w;
+        H[pivot] = hasher_.canonical();
+
+        for (uint16_t i = m; i < k; ++i) {
+            const uint8_t out_2bit = static_cast<uint8_t>(lmer_ >> (2 * (m - 1))) & 0x3u;
+            const uint8_t in_2bit  = get_nt(i) & 3u;
+            lmer_ = ((lmer_ & clear_msn_) << 2) | in_2bit;
+            hasher_.roll(out_2bit, in_2bit);
+            --pivot;
+            H[pivot] = hasher_.canonical();
+        }
+        reset_h0_pos_ = static_cast<uint64_t>(w);
+        reset_windows();
+    }
+
     // Slide by one ASCII character.
     void advance(char ch) noexcept {
         advance_impl(nt_hash::to_2bit(ch));
+    }
+
+    void advance_nt(uint8_t nt_b) noexcept {
+        advance_impl(nt_b & 3u);
     }
 
     // Slide by one base in kache encoding (A=0, C=1, G=2, T=3).

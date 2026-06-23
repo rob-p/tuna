@@ -41,7 +41,8 @@ void print_usage(const char* prog)
 #endif
         "  -n  <int>   number of partitions        [default: auto, ~2 MB input/partition]\n"
         "  -t  <int>   worker threads              [default: 1]\n"
-        "              phase 1: parallel over input files (capped at #files)\n"
+        "              phase 1: parallel over input files; gz input also uses\n"
+        "                       producer/consumer parsing within files\n"
         "              phase 2: parallel over partitions  (capped at -n)\n"
         "  -ci <int>   minimum k-mer count         [default: 1]\n"
         "  -cx <int>   maximum k-mer count         [default: max]\n"
@@ -55,6 +56,7 @@ void print_usage(const char* prog)
         "  -hp         hide progress messages\n"
         "  -kt         keep temp partition files after run (useful for benchmarking)\n"
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
+        "  -p2         run phase 2 only from kept partition files in -w\n"
         "  -co         count only: skip output writing after k-mer counting\n"
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
@@ -161,6 +163,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.keep_tmp = true;
         } else if (arg == "-tp") {
             cfg.partition_only = true;
+        } else if (arg == "-p2") {
+            cfg.phase2_only = true;
         } else if (arg == "-co") {
             cfg.count_only = true;
         } else if (!arg.empty() && arg[0] == '-') {
@@ -171,8 +175,11 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         }
     }
 
-    if (positionals.size() < 2) {
-        std::cerr << "tuna: error: need at least one input file and an output file\n";
+    if ((!cfg.phase2_only && positionals.size() < 2) ||
+        (cfg.phase2_only && positionals.empty())) {
+        std::cerr << "tuna: error: need "
+                  << (cfg.phase2_only ? "an output file" : "at least one input file and an output file")
+                  << "\n";
         return false;
     }
 
@@ -201,7 +208,7 @@ bool parse_args(int argc, char* argv[], Config& cfg)
         cfg.input_files = std::move(positionals);
     }
 
-    if (cfg.input_files.empty()) {
+    if (!cfg.phase2_only && cfg.input_files.empty()) {
         std::cerr << "tuna: error: no input files\n";
         return false;
     }

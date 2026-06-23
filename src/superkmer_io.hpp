@@ -22,24 +22,17 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <filesystem>
 
 // Returns the path to the superkmer file for partition p under work_dir.
 inline std::string partition_path(const std::string& work_dir, size_t p)
 {
     return work_dir + "hash_" + std::to_string(p) + ".superkmers";
 }
-
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
-#ifndef MAP_POPULATE
-#  define MAP_POPULATE 0
-#endif
 
 // Deduce the header integer type for a given (k, m) pair.
 // uint8_t  when 2k − m ≤ 255  (header fits in one byte, 2-byte header total)
@@ -171,6 +164,38 @@ struct SuperkmerWriter
         }
     }
 
+    template <typename GetNtBase>
+    void append_nt(GetNtBase&& get_nt, size_t start, hdr_t len, hdr_t min_pos)
+    {
+        const size_t packed_bytes = (len + 3u) / 4u;
+        char* dst = reserve_inline(HDR_BYTES + packed_bytes);
+        std::memcpy(dst,                 &len,     sizeof(hdr_t));
+        std::memcpy(dst + sizeof(hdr_t), &min_pos, sizeof(hdr_t));
+        uint8_t* packed = reinterpret_cast<uint8_t*>(dst + HDR_BYTES);
+
+        size_t i = 0;
+        for (; i + 4 <= static_cast<size_t>(len); i += 4) {
+            const uint8_t nt0 = get_nt(start + i);
+            const uint8_t nt1 = get_nt(start + i + 1);
+            const uint8_t nt2 = get_nt(start + i + 2);
+            const uint8_t nt3 = get_nt(start + i + 3);
+            const uint8_t b0 = nt0 ^ (nt0 >> 1);
+            const uint8_t b1 = nt1 ^ (nt1 >> 1);
+            const uint8_t b2 = nt2 ^ (nt2 >> 1);
+            const uint8_t b3 = nt3 ^ (nt3 >> 1);
+            packed[i >> 2] = static_cast<uint8_t>((b0 << 6) | (b1 << 4) | (b2 << 2) | b3);
+        }
+        if (i < static_cast<size_t>(len)) {
+            uint8_t tail = 0;
+            for (size_t j = i; j < static_cast<size_t>(len); ++j) {
+                const uint8_t nt = get_nt(start + j);
+                const uint8_t b = nt ^ (nt >> 1);
+                tail |= static_cast<uint8_t>(b << (6u - 2u * (j - i)));
+            }
+            packed[i >> 2] = tail;
+        }
+    }
+
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
 
     void flush_to(std::ofstream& file, std::mutex& mtx)
@@ -198,53 +223,53 @@ struct SuperkmerReader
 {
     using hdr_t = sk_hdr_t<k, m>;
     static constexpr size_t HDR_BYTES = 2 * sizeof(hdr_t);
+    static constexpr size_t MAX_LEN = static_cast<size_t>(std::numeric_limits<hdr_t>::max());
+    static constexpr size_t MAX_RECORD_BYTES = HDR_BYTES + (MAX_LEN + 3u) / 4u;
 
     explicit SuperkmerReader(const std::string& path)
     {
-        fd_ = open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) return;
-
-        struct stat sb;
-        if (fstat(fd_, &sb) < 0 || sb.st_size == 0) return;
-        size_ = static_cast<size_t>(sb.st_size);
-
-        void* p = mmap(nullptr, size_, PROT_READ,
-                       MAP_PRIVATE | MAP_POPULATE, fd_, 0);
-        if (p == MAP_FAILED) return;
-        map_ = static_cast<const char*>(p);
-
-        madvise(const_cast<char*>(map_), size_,
-                MADV_SEQUENTIAL | MADV_WILLNEED);
-
-        cur_ = map_;
-        end_ = map_ + size_;
+        std::error_code ec;
+        const auto fsz = std::filesystem::file_size(path, ec);
+        if (ec || fsz == 0) return;
+        size_ = static_cast<size_t>(fsz);
+        data_.resize(size_);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return;
+        in.read(data_.data(), static_cast<std::streamsize>(data_.size()));
+        if (!in) {
+            data_.clear();
+            size_ = 0;
+            return;
+        }
+        cur_ = data_.data();
+        end_ = data_.data() + data_.size();
+        ok_ = true;
     }
 
-    ~SuperkmerReader()
-    {
-        if (map_) munmap(const_cast<char*>(map_), size_);
-        if (fd_ >= 0) close(fd_);
-    }
+    ~SuperkmerReader() = default;
 
     SuperkmerReader(const SuperkmerReader&)            = delete;
     SuperkmerReader& operator=(const SuperkmerReader&) = delete;
 
     bool next()
     {
+        if (!ok_) return false;
         if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES) > end_) return false;
         hdr_t len, mp;
-        std::memcpy(&len, cur_,                sizeof(hdr_t));
+        std::memcpy(&len, cur_,                 sizeof(hdr_t));
         std::memcpy(&mp,  cur_ + sizeof(hdr_t), sizeof(hdr_t));
         if (len == 0) return false;
         min_pos_ = mp;
-        cur_ += HDR_BYTES;
 
         const size_t packed_bytes = (static_cast<size_t>(len) + 3u) / 4u;
-        if (cur_ + static_cast<ptrdiff_t>(packed_bytes) > end_) return false;
+        if (HDR_BYTES + packed_bytes > MAX_RECORD_BYTES) return false;
+        if (cur_ + static_cast<ptrdiff_t>(HDR_BYTES + packed_bytes) > end_) return false;
 
-        ptr_ = reinterpret_cast<const uint8_t*>(cur_);
-        len_ = len;
-        cur_ += packed_bytes;
+        record_      = cur_;
+        record_size_ = HDR_BYTES + packed_bytes;
+        ptr_         = reinterpret_cast<const uint8_t*>(cur_ + HDR_BYTES);
+        len_         = len;
+        cur_        += record_size_;
         return true;
     }
 
@@ -252,17 +277,21 @@ struct SuperkmerReader
     size_t         size()        const { return len_; }
     hdr_t          min_pos()     const { return min_pos_; }
     size_t         file_size()   const { return size_; }
-    bool           ok()          const { return map_ != nullptr; }
+    bool           ok()          const { return ok_; }
+    const char*    record_data() const { return record_; }
+    size_t         record_size() const { return record_size_; }
 
 private:
-    int            fd_      = -1;      // file descriptor
-    size_t         size_    = 0;       // file size in bytes
-    const char*    map_     = nullptr; // mmap base pointer
-    const char*    cur_     = nullptr; // read cursor
-    const char*    end_     = nullptr; // one past last byte
-    const uint8_t* ptr_     = nullptr; // packed data of current superkmer
-    size_t         len_     = 0;       // length of current superkmer (bases)
-    hdr_t          min_pos_ = 0;       // minimizer position in current superkmer
+    std::vector<char> data_;
+    bool              ok_          = false;
+    size_t            size_        = 0;       // file size in bytes
+    const char*       cur_         = nullptr;
+    const char*       end_         = nullptr;
+    const char*       record_      = nullptr;
+    size_t            record_size_ = 0;
+    const uint8_t*    ptr_         = nullptr; // packed data of current superkmer
+    size_t            len_         = 0;       // length of current superkmer (bases)
+    hdr_t             min_pos_     = 0;       // minimizer position in current superkmer
 };
 
 

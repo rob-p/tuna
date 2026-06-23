@@ -160,9 +160,13 @@ private:
         Overflow_Map_Val(uint8_t cs, uint8_t min_coord, const T_& val): cs(cs), min_coord(min_coord), val(val) {}
     };
 
-    typedef std::conditional_t<is_set_,
+    using ov_set_t = std::conditional_t<mt_,
         Concurrent_Hash_Table<Kmer<k>, Overflow_Set_Val, Hash<Kmer<k>>>,
-        Concurrent_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>> > ov_t; // The overflow table type.
+        Serial_Hash_Table<Kmer<k>, Overflow_Set_Val, Hash<Kmer<k>>>>;
+    using ov_map_t = std::conditional_t<mt_,
+        Concurrent_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>>,
+        Serial_Hash_Table<Kmer<k>, Overflow_Map_Val, Hash<Kmer<k>>>>;
+    typedef std::conditional_t<is_set_, ov_set_t, ov_map_t> ov_t; // The overflow table type.
 
 
     flat_t* T;  // Flat table of size `cap x B`.
