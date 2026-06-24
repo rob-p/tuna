@@ -282,6 +282,116 @@ struct PackedReadView {
     }
 };
 
+struct RawFastqChunk {
+    std::vector<uint8_t> data;
+
+    bool empty() const noexcept { return data.empty(); }
+};
+
+inline uint8_t gz_first_byte(const std::string& path)
+{
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) throw std::runtime_error("Cannot open: " + path);
+    gzbuffer(gz, 1u << 20);
+    uint8_t c = 0;
+    const int n = gzread(gz, &c, 1);
+    gzclose(gz);
+    if (n != 1) throw std::runtime_error("Cannot read: " + path);
+    return c;
+}
+
+class RawGzFastqChunker {
+    static constexpr size_t READ_BYTES = 4u << 20;
+
+    gzFile gz_ = nullptr;
+    std::vector<uint8_t> buf_;
+    size_t target_bytes_ = 0;
+    bool eof_ = false;
+
+    static size_t last_record_boundary(const std::vector<uint8_t>& data) noexcept
+    {
+        size_t line_count = 0;
+        size_t boundary = 0;
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (data[i] == '\n') {
+                ++line_count;
+                if ((line_count & 3u) == 0)
+                    boundary = i + 1;
+            }
+        }
+        return boundary;
+    }
+
+    void read_more()
+    {
+        const size_t old_size = buf_.size();
+        buf_.resize(old_size + READ_BYTES);
+        const int n = gzread(gz_, buf_.data() + old_size, READ_BYTES);
+        if (n < 0) {
+            int errnum = 0;
+            const char* msg = gzerror(gz_, &errnum);
+            throw std::runtime_error(std::string("gzip read failed: ") + (msg ? msg : "unknown error"));
+        }
+        if (n == 0) {
+            eof_ = true;
+            buf_.resize(old_size);
+        } else {
+            buf_.resize(old_size + static_cast<size_t>(n));
+        }
+    }
+
+public:
+    RawGzFastqChunker(const std::string& path, size_t target_bytes)
+        : target_bytes_(target_bytes)
+    {
+        gz_ = gzopen(path.c_str(), "rb");
+        if (!gz_) throw std::runtime_error("Cannot open: " + path);
+        gzbuffer(gz_, 1u << 20);
+        buf_.reserve(target_bytes_ + READ_BYTES);
+    }
+
+    ~RawGzFastqChunker()
+    {
+        if (gz_) gzclose(gz_);
+    }
+
+    RawGzFastqChunker(const RawGzFastqChunker&) = delete;
+    RawGzFastqChunker& operator=(const RawGzFastqChunker&) = delete;
+
+    bool next(RawFastqChunk& out)
+    {
+        out.data.clear();
+
+        while (!eof_ && buf_.size() < target_bytes_)
+            read_more();
+
+        if (buf_.empty())
+            return false;
+
+        size_t boundary = last_record_boundary(buf_);
+        while (!eof_ && boundary == 0) {
+            read_more();
+            boundary = last_record_boundary(buf_);
+        }
+
+        if (eof_) {
+            out.data = std::move(buf_);
+            buf_.clear();
+            return !out.data.empty();
+        }
+
+        RawFastqChunk chunk;
+        chunk.data = std::move(buf_);
+        std::vector<uint8_t> tail;
+        if (boundary < chunk.data.size())
+            tail.assign(chunk.data.begin() + static_cast<std::ptrdiff_t>(boundary), chunk.data.end());
+        chunk.data.resize(boundary);
+        buf_ = std::move(tail);
+        out = std::move(chunk);
+        return !out.data.empty();
+    }
+};
+
 class AsyncPartitionWriters {
     struct Shard {
         std::mutex mtx;
@@ -535,6 +645,139 @@ PartitionStats partition_kmers_gz_pc(
 
     std::vector<std::thread> threads;
     threads.reserve(n_threads);
+    threads.emplace_back(producer_fn);
+    for (size_t t = 0; t < n_consumers; ++t)
+        threads.emplace_back(consumer_fn);
+    for (auto& th : threads) th.join();
+    async_writers.finish();
+    if (producer_error) std::rethrow_exception(producer_error);
+    if (consumer_error) std::rethrow_exception(consumer_error);
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
+
+
+// Single gzipped FASTQ path with KMC-style raw chunking: the producer only
+// decompresses and cuts at record boundaries; consumers parse/decode chunks.
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_single_gz_fastq_raw_pc(
+    const Config&               cfg,
+    const std::string&          gz_path,
+    std::vector<std::ofstream>& buckets,
+    PartitionFn                 partition_fn,
+    size_t                      write_budget_per_thread)
+{
+    using Batch = RawFastqChunk;
+
+    constexpr size_t MAX_QUEUE = 8;
+    constexpr size_t TARGET_CHUNK_BYTES = 4u << 20;
+
+    const size_t n_threads = static_cast<size_t>(cfg.num_threads);
+    const size_t n_parts = cfg.num_partitions;
+    const size_t n_consumers = std::max<size_t>(1, n_threads - 1);
+
+    std::deque<Batch> queue;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    bool producer_done = false;
+    std::atomic<bool> stop{false};
+    std::exception_ptr producer_error = nullptr;
+    std::exception_ptr consumer_error = nullptr;
+    std::mutex error_mutex;
+
+    const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
+    AsyncPartitionWriters async_writers(
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto producer_fn = [&]() {
+        try {
+            RawGzFastqChunker chunker(gz_path, TARGET_CHUNK_BYTES);
+            Batch batch;
+            while (!stop.load(std::memory_order_relaxed) && chunker.next(batch)) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&]{
+                        return queue.size() < MAX_QUEUE || stop.load(std::memory_order_relaxed);
+                    });
+                    if (stop.load(std::memory_order_relaxed)) break;
+                    queue.push_back(std::move(batch));
+                }
+                q_cv.notify_one();
+                batch = Batch{};
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(error_mutex);
+                if (!producer_error) producer_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
+        }
+        {
+            std::lock_guard<std::mutex> lk(q_mutex);
+            producer_done = true;
+        }
+        q_cv.notify_all();
+    };
+
+    auto consumer_fn = [&]() {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) async_writers.enqueue(ws[p].release_block(p));
+            };
+
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                Batch batch;
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    q_cv.wait(lk, [&]{
+                        return !queue.empty() || producer_done || stop.load(std::memory_order_relaxed);
+                    });
+                    if (queue.empty()) break;
+                    batch = std::move(queue.front());
+                    queue.pop_front();
+                }
+                q_cv.notify_one();
+
+                if (batch.data.empty()) continue;
+                helicase::FastqParser<HELICASE_ACTG_PACKED, helicase::SliceInput> parser(
+                    batch.data.data(), batch.data.size());
+                while (!stop.load(std::memory_order_relaxed) && parser.next()) {
+                    const size_t len = parser.get_dna_len();
+                    if (len < k) continue;
+                    extract_superkmers_from_packed_nt<k, m>(
+                        parser.get_dna_packed(), partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+                    ++local_seqs;
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p) {
+                if (!writers[p].empty())
+                    async_writers.enqueue(writers[p].release_block(p));
+            }
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(error_mutex);
+                if (!consumer_error) consumer_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(1 + n_consumers);
     threads.emplace_back(producer_fn);
     for (size_t t = 0; t < n_consumers; ++t)
         threads.emplace_back(consumer_fn);
@@ -949,6 +1192,9 @@ PartitionStats partition_kmers_impl(
                 all_plain = false;
             }
         }
+        if (all_gz && n_files == 1 && gz_first_byte(cfg.input_files[0]) == '@')
+            return partition_kmers_single_gz_fastq_raw_pc<k, m>(
+                cfg, cfg.input_files[0], buckets, partition_fn, write_budget_per_thread);
         if (all_gz)
             return partition_kmers_multi_gz_pc<k, m>(
                 cfg, buckets, partition_fn, write_budget_per_thread);
