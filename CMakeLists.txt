@@ -162,12 +162,16 @@ target_compile_options(tuna_lib INTERFACE ${TUNA_SIMD_FLAGS})
 # same zero-overhead runtime dispatch.
 # Usage: cmake .. -DTUNA_CONDA_PROFILE=ON
 option(TUNA_CONDA_PROFILE "Build with curated k/m subset for conda packaging" OFF)
+set(TUNA_PHASE1_SIG_LEN "" CACHE STRING "Optional phase-1 signature minimizer length; defaults to FIXED_M/runtime m")
+set(TUNA_AUTO_PARTITION_MB "" CACHE STRING "Optional auto partition throughput target in MiB; defaults to 2")
 
 target_compile_definitions(tuna_lib INTERFACE
     L1_CACHE_LINE_SIZE=${L1_CACHE_LINE_SIZE}
     TUNA_VERSION="${PROJECT_VERSION}"
     $<$<BOOL:${FIXED_K}>:FIXED_K=${FIXED_K}>
     $<$<BOOL:${FIXED_M}>:FIXED_M=${FIXED_M}>
+    $<$<BOOL:${TUNA_PHASE1_SIG_LEN}>:TUNA_PHASE1_SIG_LEN=${TUNA_PHASE1_SIG_LEN}>
+    $<$<BOOL:${TUNA_AUTO_PARTITION_MB}>:TUNA_AUTO_PARTITION_MB=${TUNA_AUTO_PARTITION_MB}>
     $<$<BOOL:${TUNA_CONDA_PROFILE}>:TUNA_CONDA_PROFILE>
 )
 target_link_libraries(tuna_lib INTERFACE xxhash ${TUNA_ZLIB_TARGET} Threads::Threads kff_io)

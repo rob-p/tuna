@@ -27,6 +27,7 @@
 #include <cstring>
 #include <type_traits>
 #include <filesystem>
+#include <utility>
 
 // Returns the path to the superkmer file for partition p under work_dir.
 inline std::string partition_path(const std::string& work_dir, size_t p)
@@ -50,6 +51,42 @@ static constexpr sk_hdr_t<k, m> sk_no_min = std::numeric_limits<sk_hdr_t<k, m>>:
 // SuperkmerWriter uses a raw POD buffer instead of std::string to avoid
 // zero-initialisation on resize.  std::string::resize zeroes new bytes even when
 // immediately overwritten; this buffer grows by doubling but skips zero-fill.
+
+struct SuperkmerWriteBlock
+{
+    size_t partition = 0;
+    char*  data      = nullptr;
+    size_t size      = 0;
+    size_t capacity  = 0;
+
+    SuperkmerWriteBlock() = default;
+    SuperkmerWriteBlock(size_t p, char* d, size_t s, size_t c) noexcept
+        : partition(p), data(d), size(s), capacity(c) {}
+
+    SuperkmerWriteBlock(const SuperkmerWriteBlock&) = delete;
+    SuperkmerWriteBlock& operator=(const SuperkmerWriteBlock&) = delete;
+
+    SuperkmerWriteBlock(SuperkmerWriteBlock&& o) noexcept
+        : partition(o.partition), data(o.data), size(o.size), capacity(o.capacity)
+    { o.data = nullptr; o.size = 0; o.capacity = 0; }
+
+    SuperkmerWriteBlock& operator=(SuperkmerWriteBlock&& o) noexcept
+    {
+        if (this != &o) {
+            ::operator delete(data);
+            partition = o.partition;
+            data      = o.data;
+            size      = o.size;
+            capacity  = o.capacity;
+            o.data = nullptr;
+            o.size = 0;
+            o.capacity = 0;
+        }
+        return *this;
+    }
+
+    ~SuperkmerWriteBlock() { ::operator delete(data); }
+};
 
 template <uint16_t k, uint16_t m>
 struct SuperkmerWriter
@@ -197,6 +234,15 @@ struct SuperkmerWriter
     }
 
     bool needs_flush() const noexcept { return sz_ >= flush_threshold; }
+
+    SuperkmerWriteBlock release_block(size_t partition)
+    {
+        SuperkmerWriteBlock block(partition, raw_, sz_, cap_);
+        cap_ = flush_threshold;
+        raw_ = static_cast<char*>(::operator new(cap_));
+        sz_  = 0;
+        return block;
+    }
 
     void flush_to(std::ofstream& file, std::mutex& mtx)
     {
