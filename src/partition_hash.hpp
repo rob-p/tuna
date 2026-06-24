@@ -102,9 +102,9 @@ void extract_superkmers_from_actg(
     ++sk_count;
 }
 
-template <uint16_t k, uint16_t m, typename PartitionFn, typename FlushFn>
+template <uint16_t k, uint16_t m, typename PackedSeq, typename PartitionFn, typename FlushFn>
 void extract_superkmers_from_packed_nt(
-    const helicase::PackedDNA&           seq,
+    const PackedSeq&                     seq,
     PartitionFn&&                        partition_fn,
     MinimizerWindow<k, m>&               min_it,
     std::vector<SuperkmerWriter<k, m>>&  writers,
@@ -150,6 +150,60 @@ void extract_superkmers_from_packed_nt(
     kmer_count += sk_len - k + 1;
     ++sk_count;
 }
+
+
+using PackedDNAWord = __uint128_t;
+
+struct PackedReadRecord {
+    size_t        word_offset = 0;
+    size_t        word_count  = 0;
+    PackedDNAWord tail        = 0;
+    size_t        len         = 0;
+};
+
+struct PackedReadBatch {
+    std::vector<PackedDNAWord> words;
+    std::vector<PackedReadRecord> records;
+    size_t bases = 0;
+
+    bool empty() const noexcept { return records.empty(); }
+
+    void reserve(size_t max_records, size_t target_bases)
+    {
+        records.reserve(max_records);
+        words.reserve((target_bases + 63u) / 64u + max_records);
+    }
+
+    void append(const helicase::PackedDNA& dna)
+    {
+        auto [dna_words, tail] = dna.bits();
+        PackedReadRecord rec;
+        rec.word_offset = words.size();
+        rec.word_count  = dna_words.size();
+        rec.tail        = tail;
+        rec.len         = dna.len();
+        words.insert(words.end(), dna_words.begin(), dna_words.end());
+        records.push_back(rec);
+        bases += rec.len;
+    }
+};
+
+struct PackedReadView {
+    const PackedDNAWord* words = nullptr;
+    size_t               word_count = 0;
+    PackedDNAWord        tail = 0;
+    size_t               len_bases = 0;
+
+    size_t len() const noexcept { return len_bases; }
+
+    uint8_t get(size_t i) const noexcept
+    {
+        const size_t word = i / 64u;
+        const size_t bit  = i % 64u;
+        const PackedDNAWord value = word < word_count ? words[word] : tail;
+        return static_cast<uint8_t>((value >> (2u * bit)) & 0b11u);
+    }
+};
 
 
 // ─── Producer-consumer harness for a single gz file ──────────────────────────
@@ -311,7 +365,7 @@ PartitionStats partition_kmers_multi_gz_pc(
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
-    using Batch = std::vector<helicase::PackedDNA>;
+    using Batch = PackedReadBatch;
 
     constexpr size_t MAX_QUEUE = 32;
     constexpr size_t MAX_BATCH_ITEMS = 8192;
@@ -348,7 +402,7 @@ PartitionStats partition_kmers_multi_gz_pc(
         }
         q_cv.notify_one();
         batch = Batch{};
-        batch.reserve(MAX_BATCH_ITEMS);
+        batch.reserve(MAX_BATCH_ITEMS, TARGET_BATCH_BASES);
         batch_bases = 0;
     };
 
@@ -365,7 +419,7 @@ PartitionStats partition_kmers_multi_gz_pc(
                 const auto& input_path = cfg.input_files[fi];
 
                 Batch batch;
-                batch.reserve(MAX_BATCH_ITEMS);
+                batch.reserve(MAX_BATCH_ITEMS, TARGET_BATCH_BASES);
                 size_t batch_bases = 0;
                 GzInput inp(input_path);
                 if (inp.first_byte() == '@') {
@@ -373,10 +427,10 @@ PartitionStats partition_kmers_multi_gz_pc(
                     while (!stop.load(std::memory_order_relaxed) && p.next()) {
                         const size_t len = p.get_dna_len();
                         if (len >= k) {
-                            batch.push_back(p.get_dna_packed_owned());
+                            batch.append(p.get_dna_packed());
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
-                                batch.size() >= MAX_BATCH_ITEMS)
+                                batch.records.size() >= MAX_BATCH_ITEMS)
                                 push_batch(batch, batch_bases);
                         }
                     }
@@ -385,10 +439,10 @@ PartitionStats partition_kmers_multi_gz_pc(
                     while (!stop.load(std::memory_order_relaxed) && p.next()) {
                         const size_t len = p.get_dna_len();
                         if (len >= k) {
-                            batch.push_back(p.get_dna_packed_owned());
+                            batch.append(p.get_dna_packed());
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
-                                batch.size() >= MAX_BATCH_ITEMS)
+                                batch.records.size() >= MAX_BATCH_ITEMS)
                                 push_batch(batch, batch_bases);
                         }
                     }
@@ -434,8 +488,14 @@ PartitionStats partition_kmers_multi_gz_pc(
                 }
                 q_cv.notify_one();
 
-                for (const auto& chunk : batch) {
+                for (const auto& rec : batch.records) {
                     if (stop.load(std::memory_order_relaxed)) break;
+                    PackedReadView chunk{
+                        batch.words.data() + rec.word_offset,
+                        rec.word_count,
+                        rec.tail,
+                        rec.len
+                    };
                     extract_superkmers_from_packed_nt<k, m>(
                         chunk, partition_fn,
                         min_it, writers, local_kmers, local_superkmers, flush_fn);
