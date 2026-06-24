@@ -32,7 +32,7 @@ tuna runs a two-phase pipeline:
 
 3. **Output (Phase 2, cont.)** — iterates the table, applies `-ci`/`-cx` count filters, and writes results to the output file in TSV or [KFF](#output-format) format.
 
-For gzipped multi-file input, Phase 1 uses producer/consumer parsing with packed read batches. Disk-mode output is handed to sharded writer threads as move-only buffers, so parser/partition workers can overlap computation with bucket file writes.
+For gzipped input, Phase 1 uses producer/consumer parsing with packed read batches in both disk and in-memory bucket modes. One or a few large plain inputs are also split into mmap-backed batches so multiple workers can partition a single file. In disk mode, all partitioning paths hand full buffers to sharded writer threads, so parser/partition workers can overlap computation with bucket file writes.
 
 Partitions are processed in parallel across threads (up to `-n` partitions at a time), keeping peak memory proportional to a single partition's k-mer set.
 
