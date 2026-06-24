@@ -538,6 +538,86 @@ class Kmer_Window
         return XXH3_64bits_withSeed(&nt_h, sizeof(nt_h), kBucketSeed);
     }
 
+    static void decode_packed_ascii(const uint8_t* packed, char* buf)
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        constexpr uint16_t full_bytes = k / 4;
+        for (uint16_t byte_idx = 0; byte_idx < full_bytes; ++byte_idx) {
+            const uint8_t x = packed[byte_idx];
+            const uint16_t out = byte_idx * 4;
+            buf[out]     = B2C[x >> 6];
+            buf[out + 1] = B2C[(x >> 4) & 3u];
+            buf[out + 2] = B2C[(x >> 2) & 3u];
+            buf[out + 3] = B2C[x & 3u];
+        }
+        if constexpr ((k & 3u) != 0) {
+            const uint8_t x = packed[full_bytes];
+            const uint16_t out = full_bytes * 4;
+            buf[out] = B2C[x >> 6];
+            if constexpr ((k & 3u) > 1)
+                buf[out + 1] = B2C[(x >> 4) & 3u];
+            if constexpr ((k & 3u) > 2)
+                buf[out + 2] = B2C[(x >> 2) & 3u];
+        }
+    }
+
+    template <bool nt_encoding>
+    static void decode_packed_ascii_bases(const uint8_t* packed, char* buf, uint8_t* bases)
+    {
+        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
+        auto store_base = [](uint8_t b) constexpr {
+            if constexpr (nt_encoding) return static_cast<uint8_t>(b ^ (b >> 1));
+            else return b;
+        };
+        constexpr uint16_t full_bytes = k / 4;
+        for (uint16_t byte_idx = 0; byte_idx < full_bytes; ++byte_idx) {
+            const uint8_t x = packed[byte_idx];
+            const uint16_t out = byte_idx * 4;
+            const uint8_t b0 = x >> 6;
+            const uint8_t b1 = (x >> 4) & 3u;
+            const uint8_t b2 = (x >> 2) & 3u;
+            const uint8_t b3 = x & 3u;
+            buf[out]     = B2C[b0];
+            buf[out + 1] = B2C[b1];
+            buf[out + 2] = B2C[b2];
+            buf[out + 3] = B2C[b3];
+            bases[out]     = store_base(b0);
+            bases[out + 1] = store_base(b1);
+            bases[out + 2] = store_base(b2);
+            bases[out + 3] = store_base(b3);
+        }
+        if constexpr ((k & 3u) != 0) {
+            const uint8_t x = packed[full_bytes];
+            const uint16_t out = full_bytes * 4;
+            const uint8_t b0 = x >> 6;
+            buf[out] = B2C[b0];
+            bases[out] = store_base(b0);
+            if constexpr ((k & 3u) > 1) {
+                const uint8_t b1 = (x >> 4) & 3u;
+                buf[out + 1] = B2C[b1];
+                bases[out + 1] = store_base(b1);
+            }
+            if constexpr ((k & 3u) > 2) {
+                const uint8_t b2 = (x >> 2) & 3u;
+                buf[out + 2] = B2C[b2];
+                bases[out + 2] = store_base(b2);
+            }
+        }
+    }
+
+    static uint64_t bases_minimizer_nt_hash(const uint8_t* bases, uint16_t min_pos)
+    {
+        uint64_t fwd = 0;
+        uint64_t rev = 0;
+        for (uint16_t i = 0; i < l; ++i) {
+            const uint8_t kb = bases[min_pos + i] & 0b11u;
+            const uint8_t b = kb ^ (kb >> 1);
+            fwd ^= nt_hash::rol64(nt_hash::FWD[b], l - 1 - i);
+            rev ^= nt_hash::rol64(nt_hash::REV[b], i);
+        }
+        return fwd ^ rev;
+    }
+
 public:
 
     // Initializes the k-mer window at the beginning of the ASCII sequence `s`.
@@ -554,11 +634,16 @@ public:
     // `packed` must contain at least k bases.
     void init_packed(const uint8_t* packed)
     {
-        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        init(buf);
+        uint8_t bases[k];
+        decode_packed_ascii_bases<true>(packed, buf, bases);
+        v.from_packed_msb(packed);
+        rh.init(buf);
+        auto get_nt = [&bases](uint16_t i) noexcept -> uint8_t {
+            return bases[i] & 0b11u;
+        };
+        nt_min.reset_nt(get_nt);
+        use_precomp_ = false;
     }
 
     // Initializes the k-mer window from ASCII sequence `s` with a precomputed
@@ -580,11 +665,9 @@ public:
     // superkmer since they all share the same minimizer.
     void init_packed_with_hash(const uint8_t* packed, uint64_t nt_h)
     {
-        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        v = Directed_Vertex<k>(Kmer<k>(buf));
+        decode_packed_ascii(packed, buf);
+        v.from_packed_msb(packed);
         rh.init(buf);
         precomp_nt_h_ = nt_h;
         precomp_bucket_h_ = bucket_hash_from_minimizer(nt_h);
@@ -598,15 +681,12 @@ public:
     // init_packed_with_hash(packed, mh) — eliminates one full decode pass.
     uint64_t init_packed_with_min(const uint8_t* packed, uint16_t min_pos)
     {
-        static constexpr char B2C[4] = {'A', 'C', 'G', 'T'};
         char buf[k];
-        for (uint16_t i = 0; i < k; ++i)
-            buf[i] = B2C[(packed[i >> 2] >> (6u - 2u * (i & 3u))) & 3u];
-        v = Directed_Vertex<k>(Kmer<k>(buf));
+        uint8_t bases[k];
+        decode_packed_ascii_bases<false>(packed, buf, bases);
+        v.from_packed_msb(packed);
         rh.init(buf);
-        nt_hash::Roller<l> roller;
-        roller.init(buf + min_pos);
-        precomp_nt_h_ = roller.canonical();
+        precomp_nt_h_ = bases_minimizer_nt_hash(bases, min_pos);
         precomp_bucket_h_ = bucket_hash_from_minimizer(precomp_nt_h_);
         use_precomp_  = true;
         return precomp_nt_h_;

@@ -138,11 +138,7 @@ public:
             lmer_ |= (uint64_t(bases[i]) << (2 * (m - 1 - i)));
         }
 
-        std::array<char, m> buf{};
-        static constexpr char B2C[4] = {'A', 'C', 'T', 'G'};
-        for (uint16_t i = 0; i < m; ++i)
-            buf[i] = B2C[bases[i]];
-        hasher_.init(buf.data());
+        hasher_.init_nt(bases.data());
 
         pivot    = w;
         H[pivot] = hasher_.canonical();
@@ -157,6 +153,15 @@ public:
         }
         reset_h0_pos_ = static_cast<uint64_t>(w);
         reset_windows();
+    }
+
+    template <typename GetKacheBase>
+    void reset_kache(GetKacheBase&& get_kache) noexcept {
+        auto get_nt = [&](uint16_t i) noexcept -> uint8_t {
+            const uint8_t b = get_kache(i) & 3u;
+            return b ^ (b >> 1);
+        };
+        reset_nt(get_nt);
     }
 
     // Slide by one ASCII character.
