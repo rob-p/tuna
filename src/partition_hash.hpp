@@ -560,8 +560,8 @@ PartitionStats partition_kmers_multi_gz_pc(
     using Batch = PackedReadBatch;
 
     constexpr size_t MAX_QUEUE = 32;
-    constexpr size_t MAX_BATCH_ITEMS = 8192;
-    constexpr size_t TARGET_BATCH_BASES = 1u << 20;
+    constexpr size_t MAX_BATCH_ITEMS = 524288;
+    constexpr size_t TARGET_BATCH_BASES = 64u << 20;
 
     const size_t n_files = cfg.input_files.size();
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
@@ -1039,8 +1039,8 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
     using Batch = PackedReadBatch;
 
     constexpr size_t MAX_QUEUE = 32;
-    constexpr size_t MAX_BATCH_ITEMS = 8192;
-    constexpr size_t TARGET_BATCH_BASES = 1u << 20;
+    constexpr size_t MAX_BATCH_ITEMS = 524288;
+    constexpr size_t TARGET_BATCH_BASES = 64u << 20;
 
     const size_t n_files = cfg.input_files.size();
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
