@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <limits>
 
-template <uint16_t k, uint16_t m>
+template <uint16_t k, uint16_t m, bool TrackPos = true>
 class MinimizerWindow {
     static_assert(m < k,  "minimizer length m must be strictly less than k-mer length k");
     // lmer_ stores the 2-bit packed m-mer in a uint64_t — limits m to 32.
@@ -66,15 +66,18 @@ class MinimizerWindow {
 
     void reset_windows() noexcept {
         M_pre[0]     = H[0];
-        M_pre_idx[0] = 0;
+        if constexpr (TrackPos)
+            M_pre_idx[0] = 0;
         for (std::size_t i = 1; i <= w; ++i) {
             // Branchless CMOV: 50%-taken comparisons cause mispredictions otherwise.
             const bool lt = H[i] < M_pre[i - 1];
             M_pre[i]     = lt ? H[i]                    : M_pre[i - 1];
-            M_pre_idx[i] = lt ? static_cast<uint8_t>(i) : M_pre_idx[i - 1];
+            if constexpr (TrackPos)
+                M_pre_idx[i] = lt ? static_cast<uint8_t>(i) : M_pre_idx[i - 1];
         }
         M_suf     = U64_MAX;
-        M_suf_idx = 0;
+        if constexpr (TrackPos)
+            M_suf_idx = 0;
         pivot     = w;
     }
 
@@ -89,12 +92,14 @@ class MinimizerWindow {
         // Branchless CMOV: M_suf_idx is size_t (not uint8_t) — x86 has no 8-bit CMOV.
         const bool lt = (h < M_suf);
         M_suf     = lt ? h      : M_suf;
-        M_suf_idx = lt ? pivot  : M_suf_idx;
+        if constexpr (TrackPos)
+            M_suf_idx = lt ? pivot  : M_suf_idx;
 
         if (pivot > 0)
             --pivot;
         else {
-            reset_h0_pos_ += static_cast<uint64_t>(w) + 1; // advance by one full cycle
+            if constexpr (TrackPos)
+                reset_h0_pos_ += static_cast<uint64_t>(w) + 1; // advance by one full cycle
             reset_windows();
         }
     }
@@ -125,7 +130,8 @@ public:
         }
         // After loop: pivot=0, H[0] = hash of last m-mer in the initial k-mer window
         // (at position w = k-m).  First advance gives position w+1.
-        reset_h0_pos_ = static_cast<uint64_t>(w); // position of H[0] in this initial fill
+        if constexpr (TrackPos)
+            reset_h0_pos_ = static_cast<uint64_t>(w); // position of H[0] in this initial fill
         reset_windows();
     }
 
@@ -151,7 +157,8 @@ public:
             --pivot;
             H[pivot] = hasher_.canonical();
         }
-        reset_h0_pos_ = static_cast<uint64_t>(w);
+        if constexpr (TrackPos)
+            reset_h0_pos_ = static_cast<uint64_t>(w);
         reset_windows();
     }
 
@@ -202,12 +209,14 @@ public:
         H[pivot] = h;
         const bool lt = (h < M_suf);
         M_suf     = lt ? h      : M_suf;
-        M_suf_idx = lt ? pivot  : M_suf_idx;
+        if constexpr (TrackPos)
+            M_suf_idx = lt ? pivot  : M_suf_idx;
 
         if (pivot > 0)
             --pivot;
         else {
-            reset_h0_pos_ += static_cast<uint64_t>(w) + 1;
+            if constexpr (TrackPos)
+                reset_h0_pos_ += static_cast<uint64_t>(w) + 1;
             reset_windows();
         }
     }
@@ -229,6 +238,7 @@ public:
     //   j ≤ pivot (previous cycle): position = reset_h0_pos_ - j
     //   j > pivot (current  cycle): position = reset_h0_pos_ + w + 1 - j
     uint64_t min_lmer_pos() const noexcept {
+        static_assert(TrackPos, "min_lmer_pos() requires position tracking");
         if (M_pre[pivot] < M_suf) {
             const std::size_t j = M_pre_idx[pivot]; // j ≤ pivot (previous cycle)
             return reset_h0_pos_ - j;

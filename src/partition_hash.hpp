@@ -64,7 +64,7 @@ void extract_superkmers_from_actg_sig(
     const char* const                    seq,
     const size_t                         seq_len,
     PartitionFn&&                        partition_fn,
-    MinimizerWindow<k, sig_m>&           min_it,      // phase-1 signature iterator
+    MinimizerWindow<k, sig_m, (sig_m == m)>& min_it, // phase-1 signature iterator
     std::vector<SuperkmerWriter<k, m>>&  writers,
     uint64_t&                            kmer_count,
     uint64_t&                            sk_count,
@@ -89,7 +89,9 @@ void extract_superkmers_from_actg_sig(
 
     min_it.reset(seq);   // initialises from ASCII (called once per sequence — cheap)
     uint64_t prev_hash    = min_it.hash();
-    uint64_t prev_min_pos = min_it.min_lmer_pos(); // absolute pos within seq
+    uint64_t prev_min_pos = 0;
+    if constexpr (sig_m == m)
+        prev_min_pos = min_it.min_lmer_pos(); // absolute pos within seq
     size_t   pid          = partition_fn(prev_hash);  // partition id
     size_t   sk_start     = 0;                        // superkmer start position in current sequence
 
@@ -98,26 +100,25 @@ void extract_superkmers_from_actg_sig(
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = [] (uint64_t p, size_t s) {
-                if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-                else return NO_MIN;
-            }(prev_min_pos, sk_start);
+            hdr_t min_pos = NO_MIN;
+            if constexpr (sig_m == m)
+                min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
             writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
             prev_hash    = new_hash;
-            prev_min_pos = min_it.min_lmer_pos();
+            if constexpr (sig_m == m)
+                prev_min_pos = min_it.min_lmer_pos();
             pid          = partition_fn(new_hash);
             sk_start     = pos - (k - 1);
         }
     }
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = [] (uint64_t p, size_t s) {
-        if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-        else return NO_MIN;
-    }(prev_min_pos, sk_start);
+    hdr_t min_pos = NO_MIN;
+    if constexpr (sig_m == m)
+        min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
     writers[pid].append_kache(kache_buf.data() + sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
@@ -142,7 +143,7 @@ void extract_superkmers_from_actg(
             seq, seq_len, std::forward<PartitionFn>(partition_fn), min_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn), kache_buf);
     } else {
-        MinimizerWindow<k, sig_m> sig_it;
+        MinimizerWindow<k, sig_m, false> sig_it;
         extract_superkmers_from_actg_sig<k, m, sig_m>(
             seq, seq_len, std::forward<PartitionFn>(partition_fn), sig_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn), kache_buf);
@@ -154,7 +155,7 @@ void extract_superkmers_from_kache_sig(
     const uint8_t* const                 seq,
     const size_t                         seq_len,
     PartitionFn&&                        partition_fn,
-    MinimizerWindow<k, sig_m>&           min_it,
+    MinimizerWindow<k, sig_m, (sig_m == m)>& min_it,
     std::vector<SuperkmerWriter<k, m>>&  writers,
     uint64_t&                            kmer_count,
     uint64_t&                            sk_count,
@@ -172,7 +173,9 @@ void extract_superkmers_from_kache_sig(
 
     min_it.reset_kache(get_kache);
     uint64_t prev_hash    = min_it.hash();
-    uint64_t prev_min_pos = min_it.min_lmer_pos();
+    uint64_t prev_min_pos = 0;
+    if constexpr (sig_m == m)
+        prev_min_pos = min_it.min_lmer_pos();
     size_t   pid          = partition_fn(prev_hash);
     size_t   sk_start     = 0;
 
@@ -181,26 +184,25 @@ void extract_superkmers_from_kache_sig(
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = [] (uint64_t p, size_t s) {
-                if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-                else return NO_MIN;
-            }(prev_min_pos, sk_start);
+            hdr_t min_pos = NO_MIN;
+            if constexpr (sig_m == m)
+                min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
             writers[pid].append_kache(seq + sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
             prev_hash    = new_hash;
-            prev_min_pos = min_it.min_lmer_pos();
+            if constexpr (sig_m == m)
+                prev_min_pos = min_it.min_lmer_pos();
             pid          = partition_fn(new_hash);
             sk_start     = pos - (k - 1);
         }
     }
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = [] (uint64_t p, size_t s) {
-        if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-        else return NO_MIN;
-    }(prev_min_pos, sk_start);
+    hdr_t min_pos = NO_MIN;
+    if constexpr (sig_m == m)
+        min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
     writers[pid].append_kache(seq + sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
@@ -224,7 +226,7 @@ void extract_superkmers_from_kache(
             seq, seq_len, std::forward<PartitionFn>(partition_fn), min_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn));
     } else {
-        MinimizerWindow<k, sig_m> sig_it;
+        MinimizerWindow<k, sig_m, false> sig_it;
         extract_superkmers_from_kache_sig<k, m, sig_m>(
             seq, seq_len, std::forward<PartitionFn>(partition_fn), sig_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn));
@@ -235,7 +237,7 @@ template <uint16_t k, uint16_t m, uint16_t sig_m, typename PackedSeq, typename P
 void extract_superkmers_from_packed_nt_sig(
     const PackedSeq&                     seq,
     PartitionFn&&                        partition_fn,
-    MinimizerWindow<k, sig_m>&           min_it,
+    MinimizerWindow<k, sig_m, (sig_m == m)>& min_it,
     std::vector<SuperkmerWriter<k, m>>&  writers,
     uint64_t&                            kmer_count,
     uint64_t&                            sk_count,
@@ -254,7 +256,9 @@ void extract_superkmers_from_packed_nt_sig(
 
     min_it.reset_nt(get_nt);
     uint64_t prev_hash    = min_it.hash();
-    uint64_t prev_min_pos = min_it.min_lmer_pos();
+    uint64_t prev_min_pos = 0;
+    if constexpr (sig_m == m)
+        prev_min_pos = min_it.min_lmer_pos();
     size_t   pid          = partition_fn(prev_hash);
     size_t   sk_start     = 0;
 
@@ -263,26 +267,25 @@ void extract_superkmers_from_packed_nt_sig(
         const uint64_t new_hash = min_it.hash();
         if (__builtin_expect(new_hash != prev_hash || pos - sk_start >= HDR_MAX, 0)) {
             const auto sk_len  = static_cast<hdr_t>(pos - sk_start);
-            const auto min_pos = [] (uint64_t p, size_t s) {
-                if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-                else return NO_MIN;
-            }(prev_min_pos, sk_start);
+            hdr_t min_pos = NO_MIN;
+            if constexpr (sig_m == m)
+                min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
             writers[pid].append_nt(get_nt, sk_start, sk_len, min_pos);
             flush_fn(writers, pid);
             kmer_count += sk_len - k + 1;
             ++sk_count;
             prev_hash    = new_hash;
-            prev_min_pos = min_it.min_lmer_pos();
+            if constexpr (sig_m == m)
+                prev_min_pos = min_it.min_lmer_pos();
             pid          = partition_fn(new_hash);
             sk_start     = pos - (k - 1);
         }
     }
 
     const auto sk_len  = static_cast<hdr_t>(seq_len - sk_start);
-    const auto min_pos = [] (uint64_t p, size_t s) {
-        if constexpr (sig_m == m) return static_cast<hdr_t>(p - s);
-        else return NO_MIN;
-    }(prev_min_pos, sk_start);
+    hdr_t min_pos = NO_MIN;
+    if constexpr (sig_m == m)
+        min_pos = static_cast<hdr_t>(prev_min_pos - sk_start);
     writers[pid].append_nt(get_nt, sk_start, sk_len, min_pos);
     flush_fn(writers, pid);
     kmer_count += sk_len - k + 1;
@@ -305,7 +308,7 @@ void extract_superkmers_from_packed_nt(
             seq, std::forward<PartitionFn>(partition_fn), min_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn));
     } else {
-        MinimizerWindow<k, sig_m> sig_it;
+        MinimizerWindow<k, sig_m, false> sig_it;
         extract_superkmers_from_packed_nt_sig<k, m, sig_m>(
             seq, std::forward<PartitionFn>(partition_fn), sig_it, writers,
             kmer_count, sk_count, std::forward<FlushFn>(flush_fn));
@@ -535,9 +538,13 @@ class AsyncPartitionWriters {
         bool done = false;
     };
 
-    std::vector<std::ofstream>& buckets_;
+    std::vector<SuperkmerBucketFile>& buckets_;
     std::vector<std::unique_ptr<Shard>> shards_;
     std::vector<std::thread> threads_;
+#ifdef TUNA_LZ4_BUCKETS
+    std::vector<uint8_t> initialized_;
+    bool lz4_buckets_ = false;
+#endif
     size_t max_queue_bytes_;
     std::exception_ptr error_ = nullptr;
     std::mutex error_mutex_;
@@ -575,7 +582,20 @@ class AsyncPartitionWriters {
             if (failed) continue;
             try {
                 auto& out = buckets_[block.partition];
-                out.write(block.data, static_cast<std::streamsize>(block.size));
+#ifdef TUNA_LZ4_BUCKETS
+                if (lz4_buckets_ && !initialized_[block.partition]) {
+                    tuna_superkmer_detail::write_lz4_bucket_magic(out);
+                    initialized_[block.partition] = 1;
+                }
+#endif
+                tuna_superkmer_detail::write_superkmer_bucket_block(
+                    out, block.data, block.size,
+#ifdef TUNA_LZ4_BUCKETS
+                    lz4_buckets_
+#else
+                    false
+#endif
+                );
                 if (!out) throw std::runtime_error("tuna: failed while writing partition file");
             } catch (...) {
                 failed = true;
@@ -585,10 +605,15 @@ class AsyncPartitionWriters {
     }
 
 public:
-    AsyncPartitionWriters(std::vector<std::ofstream>& buckets,
+    AsyncPartitionWriters(std::vector<SuperkmerBucketFile>& buckets,
                           size_t n_shards,
-                          size_t max_queue_bytes)
+                          size_t max_queue_bytes,
+                          bool lz4_buckets = false)
         : buckets_(buckets),
+#ifdef TUNA_LZ4_BUCKETS
+          initialized_(buckets_.size(), 0),
+          lz4_buckets_(lz4_buckets),
+#endif
           max_queue_bytes_(max_queue_bytes)
     {
         n_shards = std::max<size_t>(1, std::min(n_shards, buckets_.size()));
@@ -652,7 +677,7 @@ template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_gz_pc(
     const Config&               cfg,
     const std::string&          gz_path,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     PartitionFn                 partition_fn,
     size_t                      n_threads,          // ≥ 2 (1 producer + rest consumers)
     size_t                      write_budget_per_thread)
@@ -676,7 +701,8 @@ PartitionStats partition_kmers_gz_pc(
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
-        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     // Producer: decompress gz via GzInput, use helicase SIMD parser to deliver
@@ -797,14 +823,18 @@ template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_single_gz_fastq_raw_pc(
     const Config&               cfg,
     const std::string&          gz_path,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
     using Batch = RawFastqChunk;
 
     constexpr size_t MAX_QUEUE = 8;
+#ifdef TUNA_FASTQ_CHUNK_MB
+    constexpr size_t TARGET_CHUNK_BYTES = static_cast<size_t>(TUNA_FASTQ_CHUNK_MB) << 20;
+#else
     constexpr size_t TARGET_CHUNK_BYTES = 4u << 20;
+#endif
 
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts = cfg.num_partitions;
@@ -821,7 +851,8 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
-        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
     std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     auto producer_fn = [&]() {
@@ -886,10 +917,19 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
                 while (!stop.load(std::memory_order_relaxed) && parser.next()) {
                     const size_t len = parser.get_dna_len();
                     if (len < k) continue;
+#ifdef TUNA_PACKED_NT_PHASE1
+                    auto dna = parser.get_dna_packed();
+                    auto [words, tail] = dna.bits();
+                    PackedReadView rec{words.data(), words.size(), tail, dna.len()};
+                    extract_superkmers_from_packed_nt<k, m>(
+                        rec, partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+#else
                     decode_packed_nt_to_kache(parser.get_dna_packed(), kache_buf);
                     extract_superkmers_from_kache<k, m>(
                         kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
                         local_kmers, local_superkmers, flush_fn);
+#endif
                     ++local_seqs;
                 }
             }
@@ -932,7 +972,7 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
 template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_multi_gz_pc(
     const Config&               cfg,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
@@ -960,7 +1000,8 @@ PartitionStats partition_kmers_multi_gz_pc(
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
-        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
     std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     auto push_batch = [&](Batch& batch, size_t& batch_bases) {
@@ -1070,10 +1111,16 @@ PartitionStats partition_kmers_multi_gz_pc(
                         rec.tail,
                         rec.len
                     };
+#ifdef TUNA_PACKED_NT_PHASE1
+                    extract_superkmers_from_packed_nt<k, m>(
+                        chunk, partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+#else
                     decode_packed_nt_to_kache(chunk, kache_buf);
                     extract_superkmers_from_kache<k, m>(
                         kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
                         local_kmers, local_superkmers, flush_fn);
+#endif
                     ++local_seqs;
                 }
             }
@@ -1118,7 +1165,7 @@ PartitionStats partition_kmers_multi_gz_pc(
 template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_plain_pc(
     const Config&               cfg,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
@@ -1145,7 +1192,8 @@ PartitionStats partition_kmers_plain_pc(
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
-        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
     std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
     auto push_batch = [&](Batch& batch, size_t& batch_bases) {
@@ -1313,7 +1361,7 @@ PartitionStats partition_kmers_plain_pc(
 template <uint16_t k, uint16_t m, typename PartitionFn>
 PartitionStats partition_kmers_impl(
     const Config&               cfg,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     PartitionFn                 partition_fn,
     size_t                      write_budget_per_thread)
 {
@@ -1347,7 +1395,8 @@ PartitionStats partition_kmers_impl(
     std::atomic<size_t>   next_file{0};
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads_req / 4));
     AsyncPartitionWriters async_writers(
-        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread));
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
     std::atomic<uint64_t>   total_seqs{0}, total_kmers{0}, total_superkmers{0};
     std::atomic<bool>       stop{false};
     std::exception_ptr      worker_error = nullptr;
@@ -1552,10 +1601,16 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
                         rec.tail,
                         rec.len
                     };
+#ifdef TUNA_PACKED_NT_PHASE1
+                    extract_superkmers_from_packed_nt<k, m>(
+                        chunk, partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+#else
                     decode_packed_nt_to_kache(chunk, kache_buf);
                     extract_superkmers_from_kache<k, m>(
                         kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
                         local_kmers, local_superkmers, flush_fn);
+#endif
                     ++local_seqs;
                 }
             }
@@ -2152,7 +2207,7 @@ PartitionStats partition_kmers_mem_impl(
 template <uint16_t k, uint16_t m>
 PartitionStats partition_kmers(
     const Config&               cfg,
-    std::vector<std::ofstream>& buckets,
+    std::vector<SuperkmerBucketFile>& buckets,
     size_t                      write_budget_per_thread)
 {
     const size_t n    = cfg.num_partitions;

@@ -21,6 +21,7 @@
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <array>
 #include <cstdint>
@@ -28,12 +29,293 @@
 #include <type_traits>
 #include <filesystem>
 #include <utility>
+#include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#ifdef TUNA_LZ4_BUCKETS
+#  ifdef TUNA_HAVE_LZ4_H
+#    include <lz4.h>
+#  else
+extern "C" {
+int LZ4_compress_default(const char* src, char* dst, int src_size, int dst_capacity);
+int LZ4_compress_fast(const char* src, char* dst, int src_size, int dst_capacity, int acceleration);
+int LZ4_decompress_safe(const char* src, char* dst, int compressed_size, int dst_capacity);
+int LZ4_compressBound(int input_size);
+}
+#  endif
+#endif
 
 // Returns the path to the superkmer file for partition p under work_dir.
 inline std::string partition_path(const std::string& work_dir, size_t p)
 {
     return work_dir + "hash_" + std::to_string(p) + ".superkmers";
 }
+
+class SuperkmerBucketFile {
+public:
+    SuperkmerBucketFile() = default;
+
+    SuperkmerBucketFile(const SuperkmerBucketFile&) = delete;
+    SuperkmerBucketFile& operator=(const SuperkmerBucketFile&) = delete;
+
+    SuperkmerBucketFile(SuperkmerBucketFile&& o) noexcept
+        : fd_(o.fd_), ok_(o.ok_)
+    {
+        o.fd_ = -1;
+        o.ok_ = true;
+    }
+
+    SuperkmerBucketFile& operator=(SuperkmerBucketFile&& o) noexcept
+    {
+        if (this != &o) {
+            close();
+            fd_ = o.fd_;
+            ok_ = o.ok_;
+            o.fd_ = -1;
+            o.ok_ = true;
+        }
+        return *this;
+    }
+
+    ~SuperkmerBucketFile() { close(); }
+
+    void open(const std::string& path)
+    {
+        close();
+#ifdef O_CLOEXEC
+        constexpr int cloexec = O_CLOEXEC;
+#else
+        constexpr int cloexec = 0;
+#endif
+        fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | cloexec, 0666);
+        ok_ = fd_ >= 0;
+    }
+
+    void open(const std::string& path, std::ios_base::openmode)
+    {
+        open(path);
+    }
+
+    void write(const char* data, std::streamsize n)
+    {
+        if (!ok_ || n < 0) {
+            ok_ = false;
+            return;
+        }
+        const char* cur = data;
+        size_t left = static_cast<size_t>(n);
+        while (left > 0) {
+            const ssize_t written = ::write(fd_, cur, left);
+            if (written <= 0) {
+                ok_ = false;
+                return;
+            }
+            cur += written;
+            left -= static_cast<size_t>(written);
+        }
+    }
+
+    void writev_pair(const char* a, size_t a_size, const char* b, size_t b_size)
+    {
+        if (!ok_) return;
+        iovec iov[2] = {
+            {const_cast<char*>(a), a_size},
+            {const_cast<char*>(b), b_size}
+        };
+        size_t total = a_size + b_size;
+        while (total > 0) {
+            const ssize_t written = ::writev(fd_, iov, 2);
+            if (written <= 0) {
+                ok_ = false;
+                return;
+            }
+            total -= static_cast<size_t>(written);
+            size_t done = static_cast<size_t>(written);
+            for (auto& v : iov) {
+                if (done >= v.iov_len) {
+                    done -= v.iov_len;
+                    v.iov_base = static_cast<char*>(v.iov_base) + v.iov_len;
+                    v.iov_len = 0;
+                } else {
+                    v.iov_base = static_cast<char*>(v.iov_base) + done;
+                    v.iov_len -= done;
+                    break;
+                }
+            }
+        }
+    }
+
+    void close()
+    {
+        if (fd_ >= 0) {
+            if (::close(fd_) != 0)
+                ok_ = false;
+            fd_ = -1;
+        }
+    }
+
+    explicit operator bool() const noexcept { return ok_; }
+
+private:
+    int  fd_ = -1;
+    bool ok_ = true;
+};
+
+namespace tuna_superkmer_detail {
+
+#ifdef TUNA_LZ4_BUCKETS
+inline constexpr char LZ4_BUCKET_MAGIC[] = {'T', 'U', 'N', 'A', 'L', 'Z', '4', 1};
+inline constexpr size_t LZ4_BUCKET_MAGIC_SIZE = sizeof(LZ4_BUCKET_MAGIC);
+inline constexpr uint8_t LZ4_BLOCK_RAW = 0;
+inline constexpr uint8_t LZ4_BLOCK_COMPRESSED = 1;
+
+inline void store_u32_le(char* b, uint32_t v)
+{
+    b[0] = static_cast<char>(v & 0xffu);
+    b[1] = static_cast<char>((v >> 8) & 0xffu);
+    b[2] = static_cast<char>((v >> 16) & 0xffu);
+    b[3] = static_cast<char>((v >> 24) & 0xffu);
+}
+
+template <typename Out>
+inline void write_block_payload(Out& out, const char* header, size_t header_size,
+                                const char* payload, size_t payload_size)
+{
+    out.write(header, static_cast<std::streamsize>(header_size));
+    out.write(payload, static_cast<std::streamsize>(payload_size));
+}
+
+inline void write_block_payload(SuperkmerBucketFile& out, const char* header, size_t header_size,
+                                const char* payload, size_t payload_size)
+{
+    out.writev_pair(header, header_size, payload, payload_size);
+}
+
+inline uint32_t read_u32_le(const char* b) noexcept
+{
+    return static_cast<uint32_t>(static_cast<unsigned char>(b[0]))
+         | (static_cast<uint32_t>(static_cast<unsigned char>(b[1])) << 8)
+         | (static_cast<uint32_t>(static_cast<unsigned char>(b[2])) << 16)
+         | (static_cast<uint32_t>(static_cast<unsigned char>(b[3])) << 24);
+}
+
+inline bool has_lz4_magic(const char* data) noexcept
+{
+    return std::memcmp(data, LZ4_BUCKET_MAGIC, LZ4_BUCKET_MAGIC_SIZE) == 0;
+}
+
+template <typename Out>
+inline void write_lz4_bucket_magic(Out& out)
+{
+    out.write(LZ4_BUCKET_MAGIC, static_cast<std::streamsize>(LZ4_BUCKET_MAGIC_SIZE));
+}
+#endif
+
+template <typename Out>
+inline void write_superkmer_bucket_block(Out& out, const char* data, size_t size, bool compress = false)
+{
+    if (size == 0) return;
+#ifdef TUNA_LZ4_BUCKETS
+    if (!compress) {
+        out.write(data, static_cast<std::streamsize>(size));
+        return;
+    }
+    if (size > static_cast<size_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("tuna: superkmer block too large for LZ4");
+
+    const int raw_size = static_cast<int>(size);
+    const int bound = LZ4_compressBound(raw_size);
+    thread_local std::vector<char> compressed;
+    compressed.resize(static_cast<size_t>(bound));
+#ifdef TUNA_LZ4_ACCELERATION
+    const int compressed_size = LZ4_compress_fast(
+        data, compressed.data(), raw_size, bound, TUNA_LZ4_ACCELERATION);
+#else
+    const int compressed_size = LZ4_compress_default(data, compressed.data(), raw_size, bound);
+#endif
+
+    const bool use_compressed = compressed_size > 0
+                             && static_cast<size_t>(compressed_size) + 9u < size;
+    char header[9];
+    store_u32_le(header, static_cast<uint32_t>(size));
+    if (use_compressed) {
+        store_u32_le(header + 4, static_cast<uint32_t>(compressed_size));
+        header[8] = static_cast<char>(LZ4_BLOCK_COMPRESSED);
+        write_block_payload(out, header, sizeof(header), compressed.data(),
+                            static_cast<size_t>(compressed_size));
+    } else {
+        store_u32_le(header + 4, static_cast<uint32_t>(size));
+        header[8] = static_cast<char>(LZ4_BLOCK_RAW);
+        write_block_payload(out, header, sizeof(header), data, size);
+    }
+#else
+    out.write(data, static_cast<std::streamsize>(size));
+#endif
+}
+
+#ifdef TUNA_LZ4_BUCKETS
+inline bool load_lz4_bucket(const std::string& path, std::vector<char>& out_data)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+
+    char magic[LZ4_BUCKET_MAGIC_SIZE];
+    in.read(magic, static_cast<std::streamsize>(LZ4_BUCKET_MAGIC_SIZE));
+    if (in.gcount() != static_cast<std::streamsize>(LZ4_BUCKET_MAGIC_SIZE))
+        return false;
+    if (!has_lz4_magic(magic))
+        return false;
+
+    std::error_code ec;
+    const auto compressed_size = std::filesystem::file_size(path, ec);
+    if (!ec)
+        out_data.reserve(static_cast<size_t>(compressed_size) * 2u);
+
+    char header[9];
+    std::vector<char> stored;
+    while (true) {
+        in.read(header, sizeof(header));
+        if (in.gcount() == 0 && in.eof()) break;
+        if (in.gcount() != static_cast<std::streamsize>(sizeof(header)))
+            throw std::runtime_error("tuna: truncated LZ4 superkmer bucket: " + path);
+
+        const uint32_t raw_size = read_u32_le(header);
+        const uint32_t stored_size = read_u32_le(header + 4);
+        const uint8_t flags = static_cast<uint8_t>(header[8]);
+        if (raw_size == 0 || stored_size == 0)
+            throw std::runtime_error("tuna: invalid LZ4 superkmer bucket block: " + path);
+
+        const size_t old_size = out_data.size();
+        out_data.resize(old_size + raw_size);
+        if (flags == LZ4_BLOCK_RAW) {
+            if (stored_size != raw_size)
+                throw std::runtime_error("tuna: invalid raw LZ4 superkmer bucket block: " + path);
+            in.read(out_data.data() + old_size, static_cast<std::streamsize>(raw_size));
+            if (!in)
+                throw std::runtime_error("tuna: truncated raw LZ4 superkmer bucket block: " + path);
+        } else if (flags == LZ4_BLOCK_COMPRESSED) {
+            stored.resize(stored_size);
+            in.read(stored.data(), static_cast<std::streamsize>(stored_size));
+            if (!in)
+                throw std::runtime_error("tuna: truncated compressed LZ4 superkmer bucket block: " + path);
+            const int decoded = LZ4_decompress_safe(
+                stored.data(), out_data.data() + old_size,
+                static_cast<int>(stored_size), static_cast<int>(raw_size));
+            if (decoded != static_cast<int>(raw_size))
+                throw std::runtime_error("tuna: failed to decode LZ4 superkmer bucket block: " + path);
+        } else {
+            throw std::runtime_error("tuna: unknown LZ4 superkmer bucket block type: " + path);
+        }
+    }
+
+    return true;
+}
+#endif
+
+} // namespace tuna_superkmer_detail
 
 // Deduce the header integer type for a given (k, m) pair.
 // uint8_t  when 2k − m ≤ 255  (header fits in one byte, 2-byte header total)
@@ -248,7 +530,7 @@ struct SuperkmerWriter
     {
         if (sz_ == 0) return;
         std::lock_guard<std::mutex> g(mtx);
-        file.write(raw_, static_cast<std::streamsize>(sz_));
+        tuna_superkmer_detail::write_superkmer_bucket_block(file, raw_, sz_);
         sz_ = 0;
     }
 
@@ -277,6 +559,15 @@ struct SuperkmerReader
         std::error_code ec;
         const auto fsz = std::filesystem::file_size(path, ec);
         if (ec || fsz == 0) return;
+#ifdef TUNA_LZ4_BUCKETS
+        if (tuna_superkmer_detail::load_lz4_bucket(path, data_)) {
+            size_ = data_.size();
+            cur_ = data_.data();
+            end_ = data_.data() + data_.size();
+            ok_ = true;
+            return;
+        }
+#endif
         size_ = static_cast<size_t>(fsz);
         data_.resize(size_);
         std::ifstream in(path, std::ios::binary);

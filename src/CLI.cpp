@@ -15,6 +15,7 @@ void print_usage(const char* prog)
         "Usage:\n"
         "  " << prog << " [options] <input1.fa [input2.fa ...]> <output_file>\n"
         "  " << prog << " [options] @<input_list_file>          <output_file>\n"
+        "  " << prog << " [options] <input_list_file>.fof       <output_file>\n"
         "\n"
         "Options:\n"
         "  -k  <int>   k-mer length               [default: 31]\n"
@@ -58,6 +59,10 @@ void print_usage(const char* prog)
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
         "  -p2         run phase 2 only from kept partition files in -w\n"
         "  -co         count only: skip output writing after k-mer counting\n"
+#ifdef TUNA_LZ4_BUCKETS
+        "  -lz4        compress disk-mode phase-1 buckets with default LZ4\n"
+        "  -lz4-shards compress recursive phase-2 dedup shards with default LZ4\n"
+#endif
         "  -dbg        debug stats: per-partition table summary + minimizer coverage\n"
         "              CSV written to <work_dir>/debug_min_coverage.csv\n"
         "  -kff        write output in KFF binary format (auto-detected from .kff extension)\n"
@@ -167,6 +172,20 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.phase2_only = true;
         } else if (arg == "-co") {
             cfg.count_only = true;
+        } else if (arg == "-lz4") {
+#ifdef TUNA_LZ4_BUCKETS
+            cfg.lz4_buckets = true;
+#else
+            std::cerr << "tuna: error: this binary was built without LZ4 support\n";
+            return false;
+#endif
+        } else if (arg == "-lz4-shards") {
+#ifdef TUNA_LZ4_BUCKETS
+            cfg.lz4_shards = true;
+#else
+            std::cerr << "tuna: error: this binary was built without LZ4 support\n";
+            return false;
+#endif
         } else if (!arg.empty() && arg[0] == '-') {
             std::cerr << "tuna: error: unknown option: " << arg << "\n";
             return false;
@@ -187,9 +206,23 @@ bool parse_args(int argc, char* argv[], Config& cfg)
     cfg.output_file = positionals.back();
     positionals.pop_back();
 
-    // Single positional starting with '@' is a file listing input paths.
-    if (positionals.size() == 1 && positionals[0][0] == '@') {
-        std::string list_path = positionals[0].substr(1);
+    auto has_suffix = [](const std::string& s, const char* suffix) {
+        const std::string_view sv(s);
+        const std::string_view suf(suffix);
+        return sv.size() >= suf.size() &&
+               sv.compare(sv.size() - suf.size(), suf.size(), suf) == 0;
+    };
+
+    // Single positional starting with '@', or with a common file-of-files
+    // suffix, is a file listing input paths.
+    if (positionals.size() == 1 &&
+        (positionals[0][0] == '@' ||
+         has_suffix(positionals[0], ".fof") ||
+         has_suffix(positionals[0], ".fofn") ||
+         has_suffix(positionals[0], ".list"))) {
+        std::string list_path = positionals[0][0] == '@'
+            ? positionals[0].substr(1)
+            : positionals[0];
         // Expand a leading ~/ since the shell won't do it when ~ isn't the
         // first character of the token (e.g. @~/foo stays literal).
         if (list_path.size() >= 2 && list_path[0] == '~' && list_path[1] == '/') {
@@ -202,8 +235,10 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             return false;
         }
         std::string line;
-        while (std::getline(list_f, line))
+        while (std::getline(list_f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             if (!line.empty()) cfg.input_files.push_back(line);
+        }
     } else {
         cfg.input_files = std::move(positionals);
     }

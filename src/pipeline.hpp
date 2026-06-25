@@ -283,7 +283,7 @@ int run(const Config& cfg)
 
     // ── Disk pipeline (fallback when RAM is insufficient) ──────────────────
 
-    std::vector<std::ofstream> buckets(cfg.num_partitions);
+    std::vector<SuperkmerBucketFile> buckets(cfg.num_partitions);
     for (size_t p = 0; p < cfg.num_partitions; ++p) {
         const std::string path = partition_path(cfg.work_dir, p);
         buckets[p].open(path, std::ios::binary);
@@ -412,7 +412,7 @@ void run_callback(const Config& cfg, Callback&& cb)
             return static_cast<size_t>(std::min(budget, uint64_t(512) << 20));
         }();
 
-        std::vector<std::ofstream> buckets(cfg.num_partitions);
+        std::vector<SuperkmerBucketFile> buckets(cfg.num_partitions);
         for (size_t p = 0; p < cfg.num_partitions; ++p) {
             const std::string path = partition_path(cfg.work_dir, p);
             buckets[p].open(path, std::ios::binary);

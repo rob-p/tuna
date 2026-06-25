@@ -24,5 +24,7 @@ struct Config {
     bool         count_only    = false; // count k-mers but skip output writing
     bool         debug_stats   = false; // print per-partition table stats + write minimizer coverage CSV
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
+    bool         lz4_buckets   = false; // compress disk-mode phase-1 bucket files with LZ4
+    bool         lz4_shards    = false; // compress recursive phase-2 dedup shard files with LZ4
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
 };

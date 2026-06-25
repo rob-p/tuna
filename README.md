@@ -109,6 +109,13 @@ cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_AUTO_PARTITION_MB=4
 
 `TUNA_AUTO_PARTITION_MB` changes only the throughput floor in the automatic partition-count heuristic. The cache-residency constraint can still choose a larger `-n`. Explicit `-n` on the command line always takes precedence.
 
+```bash
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_LZ4_BUCKETS=ON
+cmake .. -DFIXED_K=31 -DFIXED_M=21 -DTUNA_LZ4_BUCKETS=ON -DTUNA_LZ4_ACCELERATION=16
+```
+
+`TUNA_LZ4_BUCKETS` builds optional support for runtime `-lz4` and `-lz4-shards` flags. `-lz4` stores Phase 1 bucket blocks in an LZ4-framed superkmer format, and `-lz4-shards` applies the same default-LZ4 block format to recursive Phase 2 dedup shard files. `TUNA_LZ4_ACCELERATION` switches those modes from default LZ4 compression to `LZ4_compress_fast`; higher values favor faster compression and larger buckets. LZ4 buckets and shards can substantially reduce temporary file size on large inputs, but are disabled at runtime by default because benchmark results on current hardware show little or no runtime gain.
+
 If you want to experiment with multiple (k, m) combinations, we recommend to use a separate build directory for each:
 
 ```bash
@@ -136,10 +143,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 ```
 tuna [options] <input1.fa [input2.fa ...]> <output_file>
 tuna [options] @<input_list_file>          <output_file>
+tuna [options] <input_list_file>.fof       <output_file>
 ```
 
 Input files can be FASTA or FASTQ, plain or gzipped.
-Instead of listing files directly, you can pass `@list.txt` where `list.txt` is a newline-separated file of paths.
+Instead of listing files directly, you can pass `@list.txt`, or a single `.fof`, `.fofn`, or `.list` input, where the list file contains one input path per line.
 
 ### Options
 
@@ -166,6 +174,8 @@ Instead of listing files directly, you can pass `@list.txt` where `list.txt` is 
 | `-tp` | — | off | Stop after partitioning — Phase 1 only |
 | `-p2` | — | off | Run Phase 2 only from kept partition files in `-w` |
 | `-co` | — | off | Count only; skip output writing after k-mer counting |
+| `-lz4` | — | off | Compress disk-mode Phase 1 bucket files with default LZ4 when LZ4 support is available |
+| `-lz4-shards` | — | off | Compress recursive Phase 2 dedup shard files with default LZ4 when LZ4 support is available |
 | `-dbg` | — | off | Per-partition table summary + minimizer coverage CSV written to `<work_dir>/debug_min_coverage.csv` |
 
 </details>

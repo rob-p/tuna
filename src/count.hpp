@@ -94,6 +94,7 @@ struct DiskDedupStats {
     std::atomic<uint64_t> shard_rounds{0};
     std::atomic<uint64_t> shard_files{0};
     std::atomic<uint64_t> shard_input_bytes{0};
+    std::atomic<uint64_t> shard_output_bytes{0};
 };
 
 struct Phase2TimingStats {
@@ -486,18 +487,58 @@ uint64_t count_disk_dedup_exact(
         if (!reader.ok())
             throw std::runtime_error("tuna: cannot open partition file for reading: " + path);
 
+#ifdef TUNA_LZ4_BUCKETS
+        static constexpr size_t SHARD_BUFFER_BYTES = 1u << 20;
+        std::vector<std::vector<char>> shard_buffers(n_shards);
+        std::vector<uint8_t> shard_initialized(n_shards, 0);
+        auto flush_shard = [&](size_t shard) {
+            auto& buf = shard_buffers[shard];
+            if (buf.empty()) return;
+            if (!shard_initialized[shard]) {
+                tuna_superkmer_detail::write_lz4_bucket_magic(outs[shard]);
+                shard_initialized[shard] = 1;
+            }
+            tuna_superkmer_detail::write_superkmer_bucket_block(
+                outs[shard], buf.data(), buf.size(), true);
+            buf.clear();
+        };
+#endif
+
         const uint64_t seed = 0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(level);
         while (reader.next()) {
             const uint64_t h = XXH3_64bits_withSeed(
                 reader.record_data(), reader.record_size(), seed);
             const size_t shard = static_cast<size_t>(h) & (n_shards - 1u);
+#ifdef TUNA_LZ4_BUCKETS
+            if (cfg.lz4_shards) {
+                auto& buf = shard_buffers[shard];
+                buf.insert(buf.end(), reader.record_data(), reader.record_data() + reader.record_size());
+                if (buf.size() >= SHARD_BUFFER_BYTES)
+                    flush_shard(shard);
+            } else
+#endif
             outs[shard].write(reader.record_data(),
                               static_cast<std::streamsize>(reader.record_size()));
         }
+#ifdef TUNA_LZ4_BUCKETS
+        if (cfg.lz4_shards) {
+            for (size_t s = 0; s < n_shards; ++s)
+                flush_shard(s);
+        }
+#endif
         for (auto& out : outs) {
             out.close();
             if (!out)
                 throw std::runtime_error("tuna: failed while writing dedup shard");
+        }
+        if (stats) {
+            uint64_t written = 0;
+            for (const auto& shard : shard_paths) {
+                std::error_code ec;
+                const auto sz = std::filesystem::file_size(shard, ec);
+                if (!ec) written += static_cast<uint64_t>(sz);
+            }
+            stats->shard_output_bytes.fetch_add(written, std::memory_order_relaxed);
         }
 
         uint64_t total_inserted = 0;
@@ -1299,6 +1340,9 @@ std::pair<uint64_t, uint64_t> count_and_write(
                   << " shard_files=" << dedup_stats.shard_files.load(std::memory_order_relaxed)
                   << " shard_input_mib=" << std::setprecision(1)
                   << (static_cast<double>(dedup_stats.shard_input_bytes.load(std::memory_order_relaxed)) /
+                      (1024.0 * 1024.0))
+                  << " shard_output_mib="
+                  << (static_cast<double>(dedup_stats.shard_output_bytes.load(std::memory_order_relaxed)) /
                       (1024.0 * 1024.0))
                   << "\n";
         const uint64_t records = dedup_stats.aggregate_records.load(std::memory_order_relaxed);
