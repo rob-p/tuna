@@ -29,6 +29,10 @@
 #include <utility>
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
 
 
 // Per-writer flush threshold: max(4 KB, budget_per_thread / n_parts).
@@ -38,6 +42,86 @@ inline size_t writer_flush_threshold(size_t n_parts, size_t budget_per_thread)
 {
     constexpr size_t MIN_FLUSH_BYTES = 4u << 10;  // 4 KB minimum
     return std::max(MIN_FLUSH_BYTES, budget_per_thread / n_parts);
+}
+
+inline bool phase1_queue_stats_enabled()
+{
+    static const bool enabled = [] {
+        const char* v = std::getenv("TUNA_PHASE1_QUEUE_STATS");
+        return v && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+inline uint64_t phase1_now_ns()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+inline double phase1_ns_to_s(uint64_t ns)
+{
+    return static_cast<double>(ns) / 1.0e9;
+}
+
+inline size_t phase1_env_size(const char* name, size_t fallback)
+{
+    const char* v = std::getenv(name);
+    if (!v || v[0] == '\0') return fallback;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || parsed == 0) return fallback;
+    return static_cast<size_t>(parsed);
+}
+
+inline size_t phase1_gz_producer_threads(size_t n_files, size_t n_threads)
+{
+    if (n_threads <= 1) return 1;
+    const size_t default_producers = std::max<size_t>(1, n_threads / 2);
+    const size_t requested = phase1_env_size("TUNA_GZ_PRODUCERS", default_producers);
+    return std::min(n_files, std::min(requested, n_threads - 1));
+}
+
+struct Phase1QueueThreadStats {
+    uint64_t batches = 0;
+    uint64_t records = 0;
+    uint64_t bases = 0;
+    uint64_t kmers = 0;
+    uint64_t superkmers = 0;
+    uint64_t wait_ns = 0;
+};
+
+inline void phase1_print_thread_stats(
+    const char* label,
+    const std::vector<Phase1QueueThreadStats>& stats)
+{
+    uint64_t batches = 0, records = 0, bases = 0, kmers = 0, superkmers = 0, wait_ns = 0;
+    for (const auto& s : stats) {
+        batches += s.batches;
+        records += s.records;
+        bases += s.bases;
+        kmers += s.kmers;
+        superkmers += s.superkmers;
+        wait_ns += s.wait_ns;
+    }
+    std::cerr << "[phase1-queue] " << label
+              << " total: batches=" << batches
+              << " records=" << records
+              << " bases=" << bases
+              << " kmers=" << kmers
+              << " superkmers=" << superkmers
+              << " wait_s=" << phase1_ns_to_s(wait_ns) << "\n";
+    for (size_t i = 0; i < stats.size(); ++i) {
+        const auto& s = stats[i];
+        std::cerr << "[phase1-queue] " << label << "[" << i << "]"
+                  << " batches=" << s.batches
+                  << " records=" << s.records
+                  << " bases=" << s.bases
+                  << " kmers=" << s.kmers
+                  << " superkmers=" << s.superkmers
+                  << " wait_s=" << phase1_ns_to_s(s.wait_ns) << "\n";
+    }
 }
 
 
@@ -536,6 +620,14 @@ class AsyncPartitionWriters {
         std::deque<SuperkmerWriteBlock> queue;
         size_t queued_bytes = 0;
         bool done = false;
+        uint64_t enqueued_blocks = 0;
+        uint64_t enqueued_bytes = 0;
+        uint64_t written_blocks = 0;
+        uint64_t written_bytes = 0;
+        uint64_t enqueue_wait_ns = 0;
+        uint64_t worker_wait_ns = 0;
+        size_t max_queued_bytes = 0;
+        size_t max_queue_depth = 0;
     };
 
     std::vector<SuperkmerBucketFile>& buckets_;
@@ -546,6 +638,7 @@ class AsyncPartitionWriters {
     bool lz4_buckets_ = false;
 #endif
     size_t max_queue_bytes_;
+    bool stats_enabled_ = false;
     std::exception_ptr error_ = nullptr;
     std::mutex error_mutex_;
 
@@ -568,7 +661,9 @@ class AsyncPartitionWriters {
             SuperkmerWriteBlock block;
             {
                 std::unique_lock<std::mutex> lk(shard.mtx);
+                const uint64_t wait_start = stats_enabled_ ? phase1_now_ns() : 0;
                 shard.cv.wait(lk, [&]{ return shard.done || !shard.queue.empty(); });
+                if (stats_enabled_) shard.worker_wait_ns += phase1_now_ns() - wait_start;
                 if (shard.queue.empty()) {
                     if (shard.done) break;
                     continue;
@@ -576,6 +671,10 @@ class AsyncPartitionWriters {
                 block = std::move(shard.queue.front());
                 shard.queue.pop_front();
                 shard.queued_bytes -= block.size;
+                if (stats_enabled_) {
+                    ++shard.written_blocks;
+                    shard.written_bytes += block.size;
+                }
             }
             shard.cv.notify_all();
 
@@ -616,6 +715,7 @@ public:
 #endif
           max_queue_bytes_(max_queue_bytes)
     {
+        stats_enabled_ = phase1_queue_stats_enabled();
         n_shards = std::max<size_t>(1, std::min(n_shards, buckets_.size()));
         shards_.reserve(n_shards);
         for (size_t i = 0; i < n_shards; ++i)
@@ -634,12 +734,20 @@ public:
         auto& shard = *shards_[shard_for(block.partition)];
         {
             std::unique_lock<std::mutex> lk(shard.mtx);
+            const uint64_t wait_start = stats_enabled_ ? phase1_now_ns() : 0;
             shard.cv.wait(lk, [&]{
                 return shard.done ||
                        shard.queued_bytes + block.size <= max_queue_bytes_;
             });
+            if (stats_enabled_) shard.enqueue_wait_ns += phase1_now_ns() - wait_start;
             if (shard.done) return;
             shard.queued_bytes += block.size;
+            if (stats_enabled_) {
+                ++shard.enqueued_blocks;
+                shard.enqueued_bytes += block.size;
+                shard.max_queued_bytes = std::max(shard.max_queued_bytes, shard.queued_bytes);
+                shard.max_queue_depth = std::max(shard.max_queue_depth, shard.queue.size() + 1);
+            }
             shard.queue.emplace_back(std::move(block));
         }
         shard.cv.notify_one();
@@ -657,6 +765,41 @@ public:
         }
         for (auto& th : threads_)
             if (th.joinable()) th.join();
+        if (stats_enabled_) {
+            uint64_t enq_blocks = 0, enq_bytes = 0, wr_blocks = 0, wr_bytes = 0;
+            uint64_t enq_wait_ns = 0, worker_wait_ns = 0;
+            size_t max_bytes = 0, max_depth = 0;
+            for (size_t i = 0; i < shards_.size(); ++i) {
+                auto& s = *shards_[i];
+                enq_blocks += s.enqueued_blocks;
+                enq_bytes += s.enqueued_bytes;
+                wr_blocks += s.written_blocks;
+                wr_bytes += s.written_bytes;
+                enq_wait_ns += s.enqueue_wait_ns;
+                worker_wait_ns += s.worker_wait_ns;
+                max_bytes = std::max(max_bytes, s.max_queued_bytes);
+                max_depth = std::max(max_depth, s.max_queue_depth);
+                std::cerr << "[phase1-queue] writer_shard[" << i << "]"
+                          << " enqueued_blocks=" << s.enqueued_blocks
+                          << " enqueued_bytes=" << s.enqueued_bytes
+                          << " written_blocks=" << s.written_blocks
+                          << " written_bytes=" << s.written_bytes
+                          << " enqueue_wait_s=" << phase1_ns_to_s(s.enqueue_wait_ns)
+                          << " worker_wait_s=" << phase1_ns_to_s(s.worker_wait_ns)
+                          << " max_queued_bytes=" << s.max_queued_bytes
+                          << " max_queue_depth=" << s.max_queue_depth << "\n";
+            }
+            std::cerr << "[phase1-queue] writer total:"
+                      << " shards=" << shards_.size()
+                      << " enqueued_blocks=" << enq_blocks
+                      << " enqueued_bytes=" << enq_bytes
+                      << " written_blocks=" << wr_blocks
+                      << " written_bytes=" << wr_bytes
+                      << " enqueue_wait_s=" << phase1_ns_to_s(enq_wait_ns)
+                      << " worker_wait_s=" << phase1_ns_to_s(worker_wait_ns)
+                      << " max_queued_bytes=" << max_bytes
+                      << " max_queue_depth=" << max_depth << "\n";
+        }
         if (error_) std::rethrow_exception(error_);
     }
 };
@@ -848,6 +991,10 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
     std::exception_ptr producer_error = nullptr;
     std::exception_ptr consumer_error = nullptr;
     std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    size_t max_queue_depth = 0;
+    Phase1QueueThreadStats producer_stats;
+    std::vector<Phase1QueueThreadStats> consumer_stats(n_consumers);
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
@@ -862,10 +1009,17 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
             while (!stop.load(std::memory_order_relaxed) && chunker.next(batch)) {
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
                     q_cv.wait(lk, [&]{
                         return queue.size() < MAX_QUEUE || stop.load(std::memory_order_relaxed);
                     });
+                    if (queue_stats) producer_stats.wait_ns += phase1_now_ns() - wait_start;
                     if (stop.load(std::memory_order_relaxed)) break;
+                    if (queue_stats) {
+                        ++producer_stats.batches;
+                        producer_stats.bases += batch.data.size();
+                        max_queue_depth = std::max(max_queue_depth, queue.size() + 1);
+                    }
                     queue.push_back(std::move(batch));
                 }
                 q_cv.notify_one();
@@ -885,7 +1039,7 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
         q_cv.notify_all();
     };
 
-    auto consumer_fn = [&]() {
+    auto consumer_fn = [&](size_t consumer_id) {
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
             MinimizerWindow<k, m> min_it;
@@ -902,9 +1056,11 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
                 Batch batch;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
                     q_cv.wait(lk, [&]{
                         return !queue.empty() || producer_done || stop.load(std::memory_order_relaxed);
                     });
+                    if (queue_stats) consumer_stats[consumer_id].wait_ns += phase1_now_ns() - wait_start;
                     if (queue.empty()) break;
                     batch = std::move(queue.front());
                     queue.pop_front();
@@ -912,6 +1068,10 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
                 q_cv.notify_one();
 
                 if (batch.data.empty()) continue;
+                if (queue_stats) {
+                    ++consumer_stats[consumer_id].batches;
+                    consumer_stats[consumer_id].bases += batch.data.size();
+                }
                 helicase::FastqParser<HELICASE_ACTG_PACKED, helicase::SliceInput> parser(
                     batch.data.data(), batch.data.size());
                 while (!stop.load(std::memory_order_relaxed) && parser.next()) {
@@ -931,6 +1091,9 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
                         local_kmers, local_superkmers, flush_fn);
 #endif
                     ++local_seqs;
+                    if (queue_stats) {
+                        ++consumer_stats[consumer_id].records;
+                    }
                 }
             }
 
@@ -942,6 +1105,10 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
             total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
             total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
             total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            if (queue_stats) {
+                consumer_stats[consumer_id].kmers += local_kmers;
+                consumer_stats[consumer_id].superkmers += local_superkmers;
+            }
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(error_mutex);
@@ -956,11 +1123,195 @@ PartitionStats partition_kmers_single_gz_fastq_raw_pc(
     threads.reserve(1 + n_consumers);
     threads.emplace_back(producer_fn);
     for (size_t t = 0; t < n_consumers; ++t)
-        threads.emplace_back(consumer_fn);
+        threads.emplace_back(consumer_fn, t);
     for (auto& th : threads) th.join();
     async_writers.finish();
     if (producer_error) std::rethrow_exception(producer_error);
     if (consumer_error) std::rethrow_exception(consumer_error);
+    if (queue_stats) {
+        std::cerr << "[phase1-queue] single_gz_fastq_raw"
+                  << " max_queue_depth=" << max_queue_depth
+                  << " producer_batches=" << producer_stats.batches
+                  << " producer_bytes=" << producer_stats.bases
+                  << " producer_wait_s=" << phase1_ns_to_s(producer_stats.wait_ns)
+                  << " consumers=" << n_consumers << "\n";
+        phase1_print_thread_stats("single_gz_fastq_raw_consumer", consumer_stats);
+    }
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
+
+
+// In-memory variant of the raw single-gzip FASTQ path.  The producer only
+// decompresses and cuts at record boundaries; consumers parse/decode chunks and
+// flush superkmers directly to per-partition memory buffers.
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_mem_single_gz_fastq_raw_pc(
+    const Config&             cfg,
+    const std::string&        gz_path,
+    std::vector<std::string>& bufs,
+    PartitionFn               partition_fn)
+{
+    using Batch = RawFastqChunk;
+
+    constexpr size_t MAX_QUEUE = 8;
+#ifdef TUNA_FASTQ_CHUNK_MB
+    constexpr size_t TARGET_CHUNK_BYTES = static_cast<size_t>(TUNA_FASTQ_CHUNK_MB) << 20;
+#else
+    constexpr size_t TARGET_CHUNK_BYTES = 4u << 20;
+#endif
+
+    const size_t n_threads = static_cast<size_t>(cfg.num_threads);
+    const size_t n_parts = cfg.num_partitions;
+    const size_t n_consumers = std::max<size_t>(1, n_threads - 1);
+
+    std::deque<Batch> queue;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    bool producer_done = false;
+    std::atomic<bool> stop{false};
+    std::exception_ptr producer_error = nullptr;
+    std::exception_ptr consumer_error = nullptr;
+    std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    size_t max_queue_depth = 0;
+    Phase1QueueThreadStats producer_stats;
+    std::vector<Phase1QueueThreadStats> consumer_stats(n_consumers);
+
+    std::vector<std::mutex> buf_mutexes(n_parts);
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto producer_fn = [&]() {
+        try {
+            RawGzFastqChunker chunker(gz_path, TARGET_CHUNK_BYTES);
+            Batch batch;
+            while (!stop.load(std::memory_order_relaxed) && chunker.next(batch)) {
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return queue.size() < MAX_QUEUE || stop.load(std::memory_order_relaxed);
+                    });
+                    if (queue_stats) producer_stats.wait_ns += phase1_now_ns() - wait_start;
+                    if (stop.load(std::memory_order_relaxed)) break;
+                    if (queue_stats) {
+                        ++producer_stats.batches;
+                        producer_stats.bases += batch.data.size();
+                        max_queue_depth = std::max(max_queue_depth, queue.size() + 1);
+                    }
+                    queue.push_back(std::move(batch));
+                }
+                q_cv.notify_one();
+                batch = Batch{};
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(error_mutex);
+                if (!producer_error) producer_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
+        }
+        {
+            std::lock_guard<std::mutex> lk(q_mutex);
+            producer_done = true;
+        }
+        q_cv.notify_all();
+    };
+
+    auto consumer_fn = [&](size_t consumer_id) {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+            };
+
+            while (true) {
+                if (stop.load(std::memory_order_relaxed)) break;
+                Batch batch;
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return !queue.empty() || producer_done || stop.load(std::memory_order_relaxed);
+                    });
+                    if (queue_stats) consumer_stats[consumer_id].wait_ns += phase1_now_ns() - wait_start;
+                    if (queue.empty()) break;
+                    batch = std::move(queue.front());
+                    queue.pop_front();
+                }
+                q_cv.notify_one();
+
+                if (batch.data.empty()) continue;
+                if (queue_stats) {
+                    ++consumer_stats[consumer_id].batches;
+                    consumer_stats[consumer_id].bases += batch.data.size();
+                }
+                helicase::FastqParser<HELICASE_ACTG_PACKED, helicase::SliceInput> parser(
+                    batch.data.data(), batch.data.size());
+                while (!stop.load(std::memory_order_relaxed) && parser.next()) {
+                    const size_t len = parser.get_dna_len();
+                    if (len < k) continue;
+#ifdef TUNA_PACKED_NT_PHASE1
+                    auto dna = parser.get_dna_packed();
+                    auto [words, tail] = dna.bits();
+                    PackedReadView rec{words.data(), words.size(), tail, dna.len()};
+                    extract_superkmers_from_packed_nt<k, m>(
+                        rec, partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+#else
+                    decode_packed_nt_to_kache(parser.get_dna_packed(), kache_buf);
+                    extract_superkmers_from_kache<k, m>(
+                        kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
+                        local_kmers, local_superkmers, flush_fn);
+#endif
+                    ++local_seqs;
+                    if (queue_stats)
+                        ++consumer_stats[consumer_id].records;
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            if (queue_stats) {
+                consumer_stats[consumer_id].kmers += local_kmers;
+                consumer_stats[consumer_id].superkmers += local_superkmers;
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(error_mutex);
+                if (!consumer_error) consumer_error = std::current_exception();
+            }
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(1 + n_consumers);
+    threads.emplace_back(producer_fn);
+    for (size_t t = 0; t < n_consumers; ++t)
+        threads.emplace_back(consumer_fn, t);
+    for (auto& th : threads) th.join();
+    if (producer_error) std::rethrow_exception(producer_error);
+    if (consumer_error) std::rethrow_exception(consumer_error);
+    if (queue_stats) {
+        std::cerr << "[phase1-queue] mem_single_gz_fastq_raw"
+                  << " max_queue_depth=" << max_queue_depth
+                  << " producer_batches=" << producer_stats.batches
+                  << " producer_bytes=" << producer_stats.bases
+                  << " producer_wait_s=" << phase1_ns_to_s(producer_stats.wait_ns)
+                  << " consumers=" << n_consumers << "\n";
+        phase1_print_thread_stats("mem_single_gz_fastq_raw_consumer", consumer_stats);
+    }
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -985,7 +1336,7 @@ PartitionStats partition_kmers_multi_gz_pc(
     const size_t n_files = cfg.input_files.size();
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts = cfg.num_partitions;
-    const size_t n_producers = std::min(n_files, std::max<size_t>(1, n_threads / 2));
+    const size_t n_producers = phase1_gz_producer_threads(n_files, n_threads);
     const size_t n_consumers = std::max<size_t>(1, n_threads - n_producers);
 
     std::atomic<size_t> next_file{0};
@@ -997,6 +1348,10 @@ PartitionStats partition_kmers_multi_gz_pc(
     std::exception_ptr producer_error = nullptr;
     std::exception_ptr consumer_error = nullptr;
     std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    size_t max_queue_depth = 0;
+    std::vector<Phase1QueueThreadStats> producer_stats(n_producers);
+    std::vector<Phase1QueueThreadStats> consumer_stats(n_consumers);
 
     const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
     AsyncPartitionWriters async_writers(
@@ -1004,14 +1359,22 @@ PartitionStats partition_kmers_multi_gz_pc(
         cfg.lz4_buckets);
     std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
-    auto push_batch = [&](Batch& batch, size_t& batch_bases) {
+    auto push_batch = [&](Batch& batch, size_t& batch_bases, size_t producer_id) {
         if (batch.empty()) return;
         {
             std::unique_lock<std::mutex> lk(q_mutex);
+            const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
             q_cv.wait(lk, [&]{
                 return queue.size() < MAX_QUEUE || stop.load(std::memory_order_relaxed);
             });
+            if (queue_stats) producer_stats[producer_id].wait_ns += phase1_now_ns() - wait_start;
             if (stop.load(std::memory_order_relaxed)) return;
+            if (queue_stats) {
+                ++producer_stats[producer_id].batches;
+                producer_stats[producer_id].records += batch.records.size();
+                producer_stats[producer_id].bases += batch_bases;
+                max_queue_depth = std::max(max_queue_depth, queue.size() + 1);
+            }
             queue.push_back(std::move(batch));
         }
         q_cv.notify_one();
@@ -1025,7 +1388,7 @@ PartitionStats partition_kmers_multi_gz_pc(
         q_cv.notify_all();
     };
 
-    auto producer_fn = [&]() {
+    auto producer_fn = [&](size_t producer_id) {
         try {
             while (!stop.load(std::memory_order_relaxed)) {
                 const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
@@ -1045,7 +1408,7 @@ PartitionStats partition_kmers_multi_gz_pc(
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
                                 batch.records.size() >= MAX_BATCH_ITEMS)
-                                push_batch(batch, batch_bases);
+                                push_batch(batch, batch_bases, producer_id);
                         }
                     }
                 } else {
@@ -1057,12 +1420,12 @@ PartitionStats partition_kmers_multi_gz_pc(
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
                                 batch.records.size() >= MAX_BATCH_ITEMS)
-                                push_batch(batch, batch_bases);
+                                push_batch(batch, batch_bases, producer_id);
                         }
                     }
                 }
                 if (!stop.load(std::memory_order_relaxed))
-                    push_batch(batch, batch_bases);
+                    push_batch(batch, batch_bases, producer_id);
             }
         } catch (...) {
             {
@@ -1075,7 +1438,7 @@ PartitionStats partition_kmers_multi_gz_pc(
         producer_done();
     };
 
-    auto consumer_fn = [&]() {
+    auto consumer_fn = [&](size_t consumer_id) {
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
             MinimizerWindow<k, m> min_it;
@@ -1092,16 +1455,24 @@ PartitionStats partition_kmers_multi_gz_pc(
                 Batch batch;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
                     q_cv.wait(lk, [&]{
                         return !queue.empty() ||
                                active_producers.load(std::memory_order_relaxed) == 0 ||
                                stop.load(std::memory_order_relaxed);
                     });
+                    if (queue_stats) consumer_stats[consumer_id].wait_ns += phase1_now_ns() - wait_start;
                     if (queue.empty()) break;
                     batch = std::move(queue.front());
                     queue.pop_front();
                 }
                 q_cv.notify_one();
+                if (queue_stats) {
+                    ++consumer_stats[consumer_id].batches;
+                    consumer_stats[consumer_id].records += batch.records.size();
+                    for (const auto& rec : batch.records)
+                        consumer_stats[consumer_id].bases += rec.len;
+                }
 
                 for (const auto& rec : batch.records) {
                     if (stop.load(std::memory_order_relaxed)) break;
@@ -1133,6 +1504,10 @@ PartitionStats partition_kmers_multi_gz_pc(
             total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
             total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
             total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            if (queue_stats) {
+                consumer_stats[consumer_id].kmers += local_kmers;
+                consumer_stats[consumer_id].superkmers += local_superkmers;
+            }
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(error_mutex);
@@ -1146,13 +1521,21 @@ PartitionStats partition_kmers_multi_gz_pc(
     std::vector<std::thread> threads;
     threads.reserve(n_producers + n_consumers);
     for (size_t t = 0; t < n_producers; ++t)
-        threads.emplace_back(producer_fn);
+        threads.emplace_back(producer_fn, t);
     for (size_t t = 0; t < n_consumers; ++t)
-        threads.emplace_back(consumer_fn);
+        threads.emplace_back(consumer_fn, t);
     for (auto& th : threads) th.join();
     async_writers.finish();
     if (producer_error) std::rethrow_exception(producer_error);
     if (consumer_error) std::rethrow_exception(consumer_error);
+    if (queue_stats) {
+        std::cerr << "[phase1-queue] multi_gz"
+                  << " producers=" << n_producers
+                  << " consumers=" << n_consumers
+                  << " max_queue_depth=" << max_queue_depth << "\n";
+        phase1_print_thread_stats("multi_gz_producer", producer_stats);
+        phase1_print_thread_stats("multi_gz_consumer", consumer_stats);
+    }
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -1478,7 +1861,7 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
     const size_t n_files = cfg.input_files.size();
     const size_t n_threads = static_cast<size_t>(cfg.num_threads);
     const size_t n_parts = cfg.num_partitions;
-    const size_t n_producers = std::min(n_files, std::max<size_t>(1, n_threads / 2));
+    const size_t n_producers = phase1_gz_producer_threads(n_files, n_threads);
     const size_t n_consumers = std::max<size_t>(1, n_threads - n_producers);
 
     std::atomic<size_t> next_file{0};
@@ -1490,18 +1873,30 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
     std::exception_ptr producer_error = nullptr;
     std::exception_ptr consumer_error = nullptr;
     std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    size_t max_queue_depth = 0;
+    std::vector<Phase1QueueThreadStats> producer_stats(n_producers);
+    std::vector<Phase1QueueThreadStats> consumer_stats(n_consumers);
 
     std::vector<std::mutex> buf_mutexes(n_parts);
     std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
 
-    auto push_batch = [&](Batch& batch, size_t& batch_bases) {
+    auto push_batch = [&](Batch& batch, size_t& batch_bases, size_t producer_id) {
         if (batch.empty()) return;
         {
             std::unique_lock<std::mutex> lk(q_mutex);
+            const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
             q_cv.wait(lk, [&]{
                 return queue.size() < MAX_QUEUE || stop.load(std::memory_order_relaxed);
             });
+            if (queue_stats) producer_stats[producer_id].wait_ns += phase1_now_ns() - wait_start;
             if (stop.load(std::memory_order_relaxed)) return;
+            if (queue_stats) {
+                ++producer_stats[producer_id].batches;
+                producer_stats[producer_id].records += batch.records.size();
+                producer_stats[producer_id].bases += batch_bases;
+                max_queue_depth = std::max(max_queue_depth, queue.size() + 1);
+            }
             queue.push_back(std::move(batch));
         }
         q_cv.notify_one();
@@ -1515,7 +1910,7 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
         q_cv.notify_all();
     };
 
-    auto producer_fn = [&]() {
+    auto producer_fn = [&](size_t producer_id) {
         try {
             while (!stop.load(std::memory_order_relaxed)) {
                 const size_t fi = next_file.fetch_add(1, std::memory_order_relaxed);
@@ -1535,7 +1930,7 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
                                 batch.records.size() >= MAX_BATCH_ITEMS)
-                                push_batch(batch, batch_bases);
+                                push_batch(batch, batch_bases, producer_id);
                         }
                     }
                 } else {
@@ -1547,12 +1942,12 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
                             batch_bases += len;
                             if (batch_bases >= TARGET_BATCH_BASES ||
                                 batch.records.size() >= MAX_BATCH_ITEMS)
-                                push_batch(batch, batch_bases);
+                                push_batch(batch, batch_bases, producer_id);
                         }
                     }
                 }
                 if (!stop.load(std::memory_order_relaxed))
-                    push_batch(batch, batch_bases);
+                    push_batch(batch, batch_bases, producer_id);
             }
         } catch (...) {
             {
@@ -1565,7 +1960,7 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
         producer_done();
     };
 
-    auto consumer_fn = [&]() {
+    auto consumer_fn = [&](size_t consumer_id) {
         try {
             const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
             MinimizerWindow<k, m> min_it;
@@ -1582,16 +1977,24 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
                 Batch batch;
                 {
                     std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
                     q_cv.wait(lk, [&]{
                         return !queue.empty() ||
                                active_producers.load(std::memory_order_relaxed) == 0 ||
                                stop.load(std::memory_order_relaxed);
                     });
+                    if (queue_stats) consumer_stats[consumer_id].wait_ns += phase1_now_ns() - wait_start;
                     if (queue.empty()) break;
                     batch = std::move(queue.front());
                     queue.pop_front();
                 }
                 q_cv.notify_one();
+                if (queue_stats) {
+                    ++consumer_stats[consumer_id].batches;
+                    consumer_stats[consumer_id].records += batch.records.size();
+                    for (const auto& rec : batch.records)
+                        consumer_stats[consumer_id].bases += rec.len;
+                }
 
                 for (const auto& rec : batch.records) {
                     if (stop.load(std::memory_order_relaxed)) break;
@@ -1621,6 +2024,10 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
             total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
             total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
             total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            if (queue_stats) {
+                consumer_stats[consumer_id].kmers += local_kmers;
+                consumer_stats[consumer_id].superkmers += local_superkmers;
+            }
         } catch (...) {
             {
                 std::lock_guard<std::mutex> lk(error_mutex);
@@ -1634,12 +2041,20 @@ PartitionStats partition_kmers_mem_multi_gz_pc(
     std::vector<std::thread> threads;
     threads.reserve(n_producers + n_consumers);
     for (size_t t = 0; t < n_producers; ++t)
-        threads.emplace_back(producer_fn);
+        threads.emplace_back(producer_fn, t);
     for (size_t t = 0; t < n_consumers; ++t)
-        threads.emplace_back(consumer_fn);
+        threads.emplace_back(consumer_fn, t);
     for (auto& th : threads) th.join();
     if (producer_error) std::rethrow_exception(producer_error);
     if (consumer_error) std::rethrow_exception(consumer_error);
+    if (queue_stats) {
+        std::cerr << "[phase1-queue] mem_multi_gz"
+                  << " producers=" << n_producers
+                  << " consumers=" << n_consumers
+                  << " max_queue_depth=" << max_queue_depth << "\n";
+        phase1_print_thread_stats("mem_multi_gz_producer", producer_stats);
+        phase1_print_thread_stats("mem_multi_gz_consumer", consumer_stats);
+    }
 
     return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
 }
@@ -1669,6 +2084,9 @@ PartitionStats partition_kmers_mem_impl(
                 break;
             }
         }
+        if (all_gz && n_files == 1 && gz_first_byte(cfg.input_files[0]) == '@')
+            return partition_kmers_mem_single_gz_fastq_raw_pc<k, m>(
+                cfg, cfg.input_files[0], bufs, partition_fn);
         if (all_gz)
             return partition_kmers_mem_multi_gz_pc<k, m>(cfg, bufs, partition_fn);
     }
