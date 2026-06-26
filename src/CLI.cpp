@@ -59,6 +59,7 @@ void print_usage(const char* prog)
         "  -tp         stop after partitioning (phase 1 only, for benchmarking)\n"
         "  -p2         run phase 2 only from kept partition files in -w\n"
         "  -co         count only: skip output writing after k-mer counting\n"
+        "  -p1-adaptive use experimental adaptive phase-1 scheduler for gz FASTQ\n"
 #ifdef TUNA_LZ4_BUCKETS
         "  -lz4        compress disk-mode phase-1 buckets with default LZ4\n"
         "  -lz4-shards compress recursive phase-2 dedup shards with default LZ4\n"
@@ -172,6 +173,8 @@ bool parse_args(int argc, char* argv[], Config& cfg)
             cfg.phase2_only = true;
         } else if (arg == "-co") {
             cfg.count_only = true;
+        } else if (arg == "-p1-adaptive") {
+            cfg.phase1_adaptive = true;
         } else if (arg == "-lz4") {
 #ifdef TUNA_LZ4_BUCKETS
             cfg.lz4_buckets = true;

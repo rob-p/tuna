@@ -26,5 +26,6 @@ struct Config {
     bool         output_kff    = false; // write output in KFF binary format instead of TSV
     bool         lz4_buckets   = false; // compress disk-mode phase-1 bucket files with LZ4
     bool         lz4_shards    = false; // compress recursive phase-2 dedup shard files with LZ4
+    bool         phase1_adaptive = false; // use experimental adaptive phase-1 scheduler for gz FASTQ
     uint64_t     ram_budget_bytes = 0; // 0 = auto-detect available RAM
 };

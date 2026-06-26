@@ -124,6 +124,78 @@ inline void phase1_print_thread_stats(
     }
 }
 
+struct Phase1AdaptiveWorkerStats {
+    uint64_t decompress_tasks = 0;
+    uint64_t parse_tasks = 0;
+    uint64_t decompressed_chunks = 0;
+    uint64_t decompressed_bytes = 0;
+    uint64_t parsed_chunks = 0;
+    uint64_t records = 0;
+    uint64_t raw_bytes = 0;
+    uint64_t bases = 0;
+    uint64_t kmers = 0;
+    uint64_t superkmers = 0;
+    uint64_t wait_ns = 0;
+};
+
+inline void phase1_print_adaptive_stats(
+    const char* label,
+    const std::vector<Phase1AdaptiveWorkerStats>& stats,
+    size_t max_queue_depth,
+    size_t max_pending_raw_bytes,
+    size_t low_raw_bytes,
+    size_t high_raw_bytes,
+    size_t opened_streams)
+{
+    uint64_t decompress_tasks = 0, parse_tasks = 0, decompressed_chunks = 0;
+    uint64_t decompressed_bytes = 0, parsed_chunks = 0, records = 0, raw_bytes = 0;
+    uint64_t bases = 0, kmers = 0, superkmers = 0, wait_ns = 0;
+    for (const auto& s : stats) {
+        decompress_tasks += s.decompress_tasks;
+        parse_tasks += s.parse_tasks;
+        decompressed_chunks += s.decompressed_chunks;
+        decompressed_bytes += s.decompressed_bytes;
+        parsed_chunks += s.parsed_chunks;
+        records += s.records;
+        raw_bytes += s.raw_bytes;
+        bases += s.bases;
+        kmers += s.kmers;
+        superkmers += s.superkmers;
+        wait_ns += s.wait_ns;
+    }
+    std::cerr << "[phase1-queue] " << label
+              << " total: decompress_tasks=" << decompress_tasks
+              << " parse_tasks=" << parse_tasks
+              << " decompressed_chunks=" << decompressed_chunks
+              << " decompressed_bytes=" << decompressed_bytes
+              << " parsed_chunks=" << parsed_chunks
+              << " records=" << records
+              << " raw_bytes=" << raw_bytes
+              << " bases=" << bases
+              << " kmers=" << kmers
+              << " superkmers=" << superkmers
+              << " wait_s=" << phase1_ns_to_s(wait_ns)
+              << " max_queue_depth=" << max_queue_depth
+              << " max_pending_raw_bytes=" << max_pending_raw_bytes
+              << " low_raw_bytes=" << low_raw_bytes
+              << " high_raw_bytes=" << high_raw_bytes
+              << " opened_streams=" << opened_streams << "\n";
+    for (size_t i = 0; i < stats.size(); ++i) {
+        const auto& s = stats[i];
+        std::cerr << "[phase1-queue] " << label << "_worker[" << i << "]"
+                  << " decompress_tasks=" << s.decompress_tasks
+                  << " parse_tasks=" << s.parse_tasks
+                  << " decompressed_chunks=" << s.decompressed_chunks
+                  << " decompressed_bytes=" << s.decompressed_bytes
+                  << " parsed_chunks=" << s.parsed_chunks
+                  << " records=" << s.records
+                  << " raw_bytes=" << s.raw_bytes
+                  << " bases=" << s.bases
+                  << " kmers=" << s.kmers
+                  << " superkmers=" << s.superkmers
+                  << " wait_s=" << phase1_ns_to_s(s.wait_ns) << "\n";
+    }
+}
 
 // ─── Partition logic brick (ACTG-only) ────────────────────────────────────────
 //
@@ -521,6 +593,16 @@ inline uint8_t gz_first_byte(const std::string& path)
     return c;
 }
 
+inline bool phase1_adaptive_all_gz_fastq(const Config& cfg, bool all_gz)
+{
+    if (!cfg.phase1_adaptive || !all_gz) return false;
+    for (const auto& f : cfg.input_files) {
+        if (gz_first_byte(f) != '@')
+            return false;
+    }
+    return true;
+}
+
 class RawGzFastqChunker {
     static constexpr size_t READ_BYTES = 4u << 20;
 
@@ -803,6 +885,897 @@ public:
         if (error_) std::rethrow_exception(error_);
     }
 };
+
+
+struct AdaptiveRawChunk {
+    RawFastqChunk chunk;
+};
+
+struct AdaptiveGzStream {
+    std::unique_ptr<RawGzFastqChunker> chunker;
+    size_t file_idx = 0;
+};
+
+using AdaptivePackedFastqParser = helicase::FastqParser<HELICASE_ACTG_PACKED, GzInput>;
+
+struct AdaptivePackedGzStream {
+    std::unique_ptr<AdaptivePackedFastqParser> parser;
+    size_t file_idx = 0;
+};
+
+// Adaptive gz FASTQ path: all workers share a pool of gzip streams and a raw
+// FASTQ chunk queue.  Workers choose decompression or parse/partition work from
+// queue pressure instead of a fixed producer/consumer split.
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_adaptive_gz_fastq_pc(
+    const Config&               cfg,
+    std::vector<SuperkmerBucketFile>& buckets,
+    PartitionFn                 partition_fn,
+    size_t                      write_budget_per_thread)
+{
+#ifdef TUNA_FASTQ_CHUNK_MB
+    constexpr size_t TARGET_CHUNK_BYTES = static_cast<size_t>(TUNA_FASTQ_CHUNK_MB) << 20;
+#else
+    constexpr size_t TARGET_CHUNK_BYTES = 4u << 20;
+#endif
+
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(cfg.num_threads));
+    const size_t n_files = cfg.input_files.size();
+    const size_t n_parts = cfg.num_partitions;
+    const size_t initial_streams = std::min(n_files, n_threads);
+    const size_t low_raw_bytes = TARGET_CHUNK_BYTES * std::max<size_t>(2, n_threads / 2);
+    const size_t high_raw_bytes = TARGET_CHUNK_BYTES * std::max<size_t>(4, n_threads * 2);
+
+    std::vector<AdaptiveGzStream> streams(initial_streams);
+    std::deque<size_t> ready_streams;
+    for (size_t i = 0; i < initial_streams; ++i) {
+        streams[i].file_idx = i;
+        streams[i].chunker = std::make_unique<RawGzFastqChunker>(cfg.input_files[i], TARGET_CHUNK_BYTES);
+        ready_streams.push_back(i);
+    }
+    size_t next_file = initial_streams;
+    size_t active_streams = initial_streams;
+    size_t opened_streams = initial_streams;
+
+    std::deque<AdaptiveRawChunk> raw_chunks;
+    size_t pending_raw_bytes = 0;
+    size_t max_queue_depth = 0;
+    size_t max_pending_raw_bytes = 0;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    std::vector<Phase1AdaptiveWorkerStats> worker_stats(n_threads);
+
+    const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
+    AsyncPartitionWriters async_writers(
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
+
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto record_error = [&]() {
+        std::lock_guard<std::mutex> lk(error_mutex);
+        if (!worker_error) worker_error = std::current_exception();
+    };
+
+    auto worker = [&](size_t worker_id) {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) async_writers.enqueue(ws[p].release_block(p));
+            };
+
+            while (true) {
+                RawFastqChunk batch;
+                size_t stream_id = 0;
+                bool do_parse = false;
+                bool do_decompress = false;
+
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return stop.load(std::memory_order_relaxed) ||
+                               !raw_chunks.empty() ||
+                               (!ready_streams.empty() && pending_raw_bytes < high_raw_bytes) ||
+                               active_streams == 0;
+                    });
+                    if (queue_stats) worker_stats[worker_id].wait_ns += phase1_now_ns() - wait_start;
+                    if (stop.load(std::memory_order_relaxed)) break;
+
+                    const bool can_parse = !raw_chunks.empty();
+                    const bool can_decompress = !ready_streams.empty() && pending_raw_bytes < high_raw_bytes;
+                    if (can_parse && (!can_decompress || pending_raw_bytes >= low_raw_bytes)) {
+                        batch = std::move(raw_chunks.front().chunk);
+                        raw_chunks.pop_front();
+                        pending_raw_bytes -= batch.data.size();
+                        do_parse = true;
+                    } else if (can_decompress) {
+                        stream_id = ready_streams.front();
+                        ready_streams.pop_front();
+                        do_decompress = true;
+                    } else if (can_parse) {
+                        batch = std::move(raw_chunks.front().chunk);
+                        raw_chunks.pop_front();
+                        pending_raw_bytes -= batch.data.size();
+                        do_parse = true;
+                    } else if (active_streams == 0) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                q_cv.notify_all();
+
+                if (do_decompress) {
+                    ++worker_stats[worker_id].decompress_tasks;
+                    RawFastqChunk produced;
+                    const bool have_chunk = streams[stream_id].chunker->next(produced);
+                    if (have_chunk) {
+                        const size_t produced_bytes = produced.data.size();
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            raw_chunks.push_back(AdaptiveRawChunk{std::move(produced)});
+                            pending_raw_bytes += produced_bytes;
+                            ready_streams.push_back(stream_id);
+                            max_queue_depth = std::max(max_queue_depth, raw_chunks.size());
+                            max_pending_raw_bytes = std::max(max_pending_raw_bytes, pending_raw_bytes);
+                        }
+                        ++worker_stats[worker_id].decompressed_chunks;
+                        worker_stats[worker_id].decompressed_bytes += produced_bytes;
+                        q_cv.notify_all();
+                    } else {
+                        streams[stream_id].chunker.reset();
+                        std::string next_path;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (next_file < n_files) {
+                                next_path = cfg.input_files[next_file++];
+                                ++opened_streams;
+                            } else {
+                                --active_streams;
+                            }
+                        }
+                        if (!next_path.empty()) {
+                            auto next_chunker = std::make_unique<RawGzFastqChunker>(next_path, TARGET_CHUNK_BYTES);
+                            {
+                                std::lock_guard<std::mutex> lk(q_mutex);
+                                streams[stream_id].chunker = std::move(next_chunker);
+                                ready_streams.push_back(stream_id);
+                            }
+                        }
+                        q_cv.notify_all();
+                    }
+                    continue;
+                }
+
+                if (do_parse) {
+                    ++worker_stats[worker_id].parse_tasks;
+                    ++worker_stats[worker_id].parsed_chunks;
+                    worker_stats[worker_id].raw_bytes += batch.data.size();
+                    helicase::FastqParser<HELICASE_ACTG_PACKED, helicase::SliceInput> parser(
+                        batch.data.data(), batch.data.size());
+                    while (!stop.load(std::memory_order_relaxed) && parser.next()) {
+                        const size_t len = parser.get_dna_len();
+                        if (len < k) continue;
+#ifdef TUNA_PACKED_NT_PHASE1
+                        auto dna = parser.get_dna_packed();
+                        auto [words, tail] = dna.bits();
+                        PackedReadView rec{words.data(), words.size(), tail, dna.len()};
+                        extract_superkmers_from_packed_nt<k, m>(
+                            rec, partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#else
+                        decode_packed_nt_to_kache(parser.get_dna_packed(), kache_buf);
+                        extract_superkmers_from_kache<k, m>(
+                            kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#endif
+                        ++local_seqs;
+                        ++worker_stats[worker_id].records;
+                        worker_stats[worker_id].bases += len;
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p) {
+                if (!writers[p].empty())
+                    async_writers.enqueue(writers[p].release_block(p));
+            }
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            worker_stats[worker_id].kmers += local_kmers;
+            worker_stats[worker_id].superkmers += local_superkmers;
+        } catch (...) {
+            record_error();
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    async_writers.finish();
+    if (worker_error) std::rethrow_exception(worker_error);
+    if (queue_stats) {
+        phase1_print_adaptive_stats(
+            "adaptive_gz_fastq", worker_stats, max_queue_depth,
+            max_pending_raw_bytes, low_raw_bytes, high_raw_bytes, opened_streams);
+    }
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
+
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_mem_adaptive_gz_fastq_pc(
+    const Config&             cfg,
+    std::vector<std::string>& bufs,
+    PartitionFn               partition_fn)
+{
+#ifdef TUNA_FASTQ_CHUNK_MB
+    constexpr size_t TARGET_CHUNK_BYTES = static_cast<size_t>(TUNA_FASTQ_CHUNK_MB) << 20;
+#else
+    constexpr size_t TARGET_CHUNK_BYTES = 4u << 20;
+#endif
+
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(cfg.num_threads));
+    const size_t n_files = cfg.input_files.size();
+    const size_t n_parts = cfg.num_partitions;
+    const size_t initial_streams = std::min(n_files, n_threads);
+    const size_t low_raw_bytes = TARGET_CHUNK_BYTES * std::max<size_t>(2, n_threads / 2);
+    const size_t high_raw_bytes = TARGET_CHUNK_BYTES * std::max<size_t>(4, n_threads * 2);
+
+    std::vector<AdaptiveGzStream> streams(initial_streams);
+    std::deque<size_t> ready_streams;
+    for (size_t i = 0; i < initial_streams; ++i) {
+        streams[i].file_idx = i;
+        streams[i].chunker = std::make_unique<RawGzFastqChunker>(cfg.input_files[i], TARGET_CHUNK_BYTES);
+        ready_streams.push_back(i);
+    }
+    size_t next_file = initial_streams;
+    size_t active_streams = initial_streams;
+    size_t opened_streams = initial_streams;
+
+    std::deque<AdaptiveRawChunk> raw_chunks;
+    size_t pending_raw_bytes = 0;
+    size_t max_queue_depth = 0;
+    size_t max_pending_raw_bytes = 0;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    std::vector<Phase1AdaptiveWorkerStats> worker_stats(n_threads);
+    std::vector<std::mutex> buf_mutexes(n_parts);
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto record_error = [&]() {
+        std::lock_guard<std::mutex> lk(error_mutex);
+        if (!worker_error) worker_error = std::current_exception();
+    };
+
+    auto worker = [&](size_t worker_id) {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+            };
+
+            while (true) {
+                RawFastqChunk batch;
+                size_t stream_id = 0;
+                bool do_parse = false;
+                bool do_decompress = false;
+
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return stop.load(std::memory_order_relaxed) ||
+                               !raw_chunks.empty() ||
+                               (!ready_streams.empty() && pending_raw_bytes < high_raw_bytes) ||
+                               active_streams == 0;
+                    });
+                    if (queue_stats) worker_stats[worker_id].wait_ns += phase1_now_ns() - wait_start;
+                    if (stop.load(std::memory_order_relaxed)) break;
+
+                    const bool can_parse = !raw_chunks.empty();
+                    const bool can_decompress = !ready_streams.empty() && pending_raw_bytes < high_raw_bytes;
+                    if (can_parse && (!can_decompress || pending_raw_bytes >= low_raw_bytes)) {
+                        batch = std::move(raw_chunks.front().chunk);
+                        raw_chunks.pop_front();
+                        pending_raw_bytes -= batch.data.size();
+                        do_parse = true;
+                    } else if (can_decompress) {
+                        stream_id = ready_streams.front();
+                        ready_streams.pop_front();
+                        do_decompress = true;
+                    } else if (can_parse) {
+                        batch = std::move(raw_chunks.front().chunk);
+                        raw_chunks.pop_front();
+                        pending_raw_bytes -= batch.data.size();
+                        do_parse = true;
+                    } else if (active_streams == 0) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                q_cv.notify_all();
+
+                if (do_decompress) {
+                    ++worker_stats[worker_id].decompress_tasks;
+                    RawFastqChunk produced;
+                    const bool have_chunk = streams[stream_id].chunker->next(produced);
+                    if (have_chunk) {
+                        const size_t produced_bytes = produced.data.size();
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            raw_chunks.push_back(AdaptiveRawChunk{std::move(produced)});
+                            pending_raw_bytes += produced_bytes;
+                            ready_streams.push_back(stream_id);
+                            max_queue_depth = std::max(max_queue_depth, raw_chunks.size());
+                            max_pending_raw_bytes = std::max(max_pending_raw_bytes, pending_raw_bytes);
+                        }
+                        ++worker_stats[worker_id].decompressed_chunks;
+                        worker_stats[worker_id].decompressed_bytes += produced_bytes;
+                        q_cv.notify_all();
+                    } else {
+                        streams[stream_id].chunker.reset();
+                        std::string next_path;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (next_file < n_files) {
+                                next_path = cfg.input_files[next_file++];
+                                ++opened_streams;
+                            } else {
+                                --active_streams;
+                            }
+                        }
+                        if (!next_path.empty()) {
+                            auto next_chunker = std::make_unique<RawGzFastqChunker>(next_path, TARGET_CHUNK_BYTES);
+                            {
+                                std::lock_guard<std::mutex> lk(q_mutex);
+                                streams[stream_id].chunker = std::move(next_chunker);
+                                ready_streams.push_back(stream_id);
+                            }
+                        }
+                        q_cv.notify_all();
+                    }
+                    continue;
+                }
+
+                if (do_parse) {
+                    ++worker_stats[worker_id].parse_tasks;
+                    ++worker_stats[worker_id].parsed_chunks;
+                    worker_stats[worker_id].raw_bytes += batch.data.size();
+                    helicase::FastqParser<HELICASE_ACTG_PACKED, helicase::SliceInput> parser(
+                        batch.data.data(), batch.data.size());
+                    while (!stop.load(std::memory_order_relaxed) && parser.next()) {
+                        const size_t len = parser.get_dna_len();
+                        if (len < k) continue;
+#ifdef TUNA_PACKED_NT_PHASE1
+                        auto dna = parser.get_dna_packed();
+                        auto [words, tail] = dna.bits();
+                        PackedReadView rec{words.data(), words.size(), tail, dna.len()};
+                        extract_superkmers_from_packed_nt<k, m>(
+                            rec, partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#else
+                        decode_packed_nt_to_kache(parser.get_dna_packed(), kache_buf);
+                        extract_superkmers_from_kache<k, m>(
+                            kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#endif
+                        ++local_seqs;
+                        ++worker_stats[worker_id].records;
+                        worker_stats[worker_id].bases += len;
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            worker_stats[worker_id].kmers += local_kmers;
+            worker_stats[worker_id].superkmers += local_superkmers;
+        } catch (...) {
+            record_error();
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
+    if (queue_stats) {
+        phase1_print_adaptive_stats(
+            "mem_adaptive_gz_fastq", worker_stats, max_queue_depth,
+            max_pending_raw_bytes, low_raw_bytes, high_raw_bytes, opened_streams);
+    }
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
+
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_adaptive_packed_gz_fastq_pc(
+    const Config&               cfg,
+    std::vector<SuperkmerBucketFile>& buckets,
+    PartitionFn                 partition_fn,
+    size_t                      write_budget_per_thread)
+{
+    using Batch = PackedReadBatch;
+
+    constexpr size_t MAX_BATCH_ITEMS = 524288;
+    constexpr size_t TARGET_BATCH_BASES = 64u << 20;
+
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(cfg.num_threads));
+    const size_t n_files = cfg.input_files.size();
+    const size_t n_parts = cfg.num_partitions;
+    const size_t initial_streams = std::min(n_files, n_threads);
+    const size_t low_batch_bases = TARGET_BATCH_BASES * std::max<size_t>(1, n_threads / 2);
+    const size_t high_batch_bases = TARGET_BATCH_BASES * std::max<size_t>(2, n_threads);
+
+    std::vector<AdaptivePackedGzStream> streams(initial_streams);
+    std::deque<size_t> ready_streams;
+    for (size_t i = 0; i < initial_streams; ++i) {
+        streams[i].file_idx = i;
+        GzInput inp(cfg.input_files[i]);
+        streams[i].parser = std::make_unique<AdaptivePackedFastqParser>(std::move(inp));
+        ready_streams.push_back(i);
+    }
+    size_t next_file = initial_streams;
+    size_t active_streams = initial_streams;
+    size_t opened_streams = initial_streams;
+
+    std::deque<Batch> batches;
+    size_t pending_bases = 0;
+    size_t max_queue_depth = 0;
+    size_t max_pending_bases = 0;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    std::vector<Phase1AdaptiveWorkerStats> worker_stats(n_threads);
+
+    const size_t writer_shards = std::min<size_t>(4, std::max<size_t>(1, n_threads / 4));
+    AsyncPartitionWriters async_writers(
+        buckets, writer_shards, std::max<size_t>(64u << 20, write_budget_per_thread),
+        cfg.lz4_buckets);
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto record_error = [&]() {
+        std::lock_guard<std::mutex> lk(error_mutex);
+        if (!worker_error) worker_error = std::current_exception();
+    };
+
+    auto worker = [&](size_t worker_id) {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, write_budget_per_thread);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) async_writers.enqueue(ws[p].release_block(p));
+            };
+
+            while (true) {
+                Batch batch;
+                size_t stream_id = 0;
+                bool do_parse = false;
+                bool do_produce = false;
+
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return stop.load(std::memory_order_relaxed) ||
+                               !batches.empty() ||
+                               (!ready_streams.empty() && pending_bases < high_batch_bases) ||
+                               active_streams == 0;
+                    });
+                    if (queue_stats) worker_stats[worker_id].wait_ns += phase1_now_ns() - wait_start;
+                    if (stop.load(std::memory_order_relaxed)) break;
+
+                    const bool can_parse = !batches.empty();
+                    const bool can_produce = !ready_streams.empty() && pending_bases < high_batch_bases;
+                    if (can_parse && (!can_produce || pending_bases >= low_batch_bases)) {
+                        batch = std::move(batches.front());
+                        batches.pop_front();
+                        pending_bases -= batch.bases;
+                        do_parse = true;
+                    } else if (can_produce) {
+                        stream_id = ready_streams.front();
+                        ready_streams.pop_front();
+                        do_produce = true;
+                    } else if (can_parse) {
+                        batch = std::move(batches.front());
+                        batches.pop_front();
+                        pending_bases -= batch.bases;
+                        do_parse = true;
+                    } else if (active_streams == 0) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                q_cv.notify_all();
+
+                if (do_produce) {
+                    ++worker_stats[worker_id].decompress_tasks;
+                    Batch produced;
+                    produced.reserve(MAX_BATCH_ITEMS, TARGET_BATCH_BASES);
+                    size_t produced_bases = 0;
+                    bool eof = false;
+                    auto& parser = *streams[stream_id].parser;
+                    while (!stop.load(std::memory_order_relaxed) &&
+                           produced_bases < TARGET_BATCH_BASES &&
+                           produced.records.size() < MAX_BATCH_ITEMS) {
+                        if (!parser.next()) {
+                            eof = true;
+                            break;
+                        }
+                        const size_t len = parser.get_dna_len();
+                        if (len >= k) {
+                            produced.append(parser.get_dna_packed());
+                            produced_bases += len;
+                        }
+                    }
+
+                    if (!produced.empty()) {
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            pending_bases += produced.bases;
+                            batches.push_back(std::move(produced));
+                            max_queue_depth = std::max(max_queue_depth, batches.size());
+                            max_pending_bases = std::max(max_pending_bases, pending_bases);
+                        }
+                        ++worker_stats[worker_id].decompressed_chunks;
+                        worker_stats[worker_id].decompressed_bytes += produced_bases;
+                    }
+
+                    if (!eof && !stop.load(std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        ready_streams.push_back(stream_id);
+                    } else {
+                        streams[stream_id].parser.reset();
+                        std::string next_path;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (next_file < n_files) {
+                                next_path = cfg.input_files[next_file++];
+                                ++opened_streams;
+                            } else {
+                                --active_streams;
+                            }
+                        }
+                        if (!next_path.empty()) {
+                            GzInput inp(next_path);
+                            auto next_parser = std::make_unique<AdaptivePackedFastqParser>(std::move(inp));
+                            {
+                                std::lock_guard<std::mutex> lk(q_mutex);
+                                streams[stream_id].parser = std::move(next_parser);
+                                ready_streams.push_back(stream_id);
+                            }
+                        }
+                    }
+                    q_cv.notify_all();
+                    continue;
+                }
+
+                if (do_parse) {
+                    ++worker_stats[worker_id].parse_tasks;
+                    ++worker_stats[worker_id].parsed_chunks;
+                    worker_stats[worker_id].records += batch.records.size();
+                    worker_stats[worker_id].bases += batch.bases;
+                    for (const auto& rec : batch.records) {
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        PackedReadView chunk{
+                            batch.words.data() + rec.word_offset,
+                            rec.word_count,
+                            rec.tail,
+                            rec.len
+                        };
+#ifdef TUNA_PACKED_NT_PHASE1
+                        extract_superkmers_from_packed_nt<k, m>(
+                            chunk, partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#else
+                        decode_packed_nt_to_kache(chunk, kache_buf);
+                        extract_superkmers_from_kache<k, m>(
+                            kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#endif
+                        ++local_seqs;
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p) {
+                if (!writers[p].empty())
+                    async_writers.enqueue(writers[p].release_block(p));
+            }
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            worker_stats[worker_id].kmers += local_kmers;
+            worker_stats[worker_id].superkmers += local_superkmers;
+        } catch (...) {
+            record_error();
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    async_writers.finish();
+    if (worker_error) std::rethrow_exception(worker_error);
+    if (queue_stats) {
+        phase1_print_adaptive_stats(
+            "adaptive_packed_gz_fastq", worker_stats, max_queue_depth,
+            max_pending_bases, low_batch_bases, high_batch_bases, opened_streams);
+    }
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
+
+template <uint16_t k, uint16_t m, typename PartitionFn>
+PartitionStats partition_kmers_mem_adaptive_packed_gz_fastq_pc(
+    const Config&             cfg,
+    std::vector<std::string>& bufs,
+    PartitionFn               partition_fn)
+{
+    using Batch = PackedReadBatch;
+
+    constexpr size_t MAX_BATCH_ITEMS = 524288;
+    constexpr size_t TARGET_BATCH_BASES = 64u << 20;
+
+    const size_t n_threads = std::max<size_t>(1, static_cast<size_t>(cfg.num_threads));
+    const size_t n_files = cfg.input_files.size();
+    const size_t n_parts = cfg.num_partitions;
+    const size_t initial_streams = std::min(n_files, n_threads);
+    const size_t low_batch_bases = TARGET_BATCH_BASES * std::max<size_t>(1, n_threads / 2);
+    const size_t high_batch_bases = TARGET_BATCH_BASES * std::max<size_t>(2, n_threads);
+
+    std::vector<AdaptivePackedGzStream> streams(initial_streams);
+    std::deque<size_t> ready_streams;
+    for (size_t i = 0; i < initial_streams; ++i) {
+        streams[i].file_idx = i;
+        GzInput inp(cfg.input_files[i]);
+        streams[i].parser = std::make_unique<AdaptivePackedFastqParser>(std::move(inp));
+        ready_streams.push_back(i);
+    }
+    size_t next_file = initial_streams;
+    size_t active_streams = initial_streams;
+    size_t opened_streams = initial_streams;
+
+    std::deque<Batch> batches;
+    size_t pending_bases = 0;
+    size_t max_queue_depth = 0;
+    size_t max_pending_bases = 0;
+    std::mutex q_mutex;
+    std::condition_variable q_cv;
+    std::atomic<bool> stop{false};
+    std::exception_ptr worker_error = nullptr;
+    std::mutex error_mutex;
+    const bool queue_stats = phase1_queue_stats_enabled();
+    std::vector<Phase1AdaptiveWorkerStats> worker_stats(n_threads);
+    std::vector<std::mutex> buf_mutexes(n_parts);
+    std::atomic<uint64_t> total_seqs{0}, total_kmers{0}, total_superkmers{0};
+
+    auto record_error = [&]() {
+        std::lock_guard<std::mutex> lk(error_mutex);
+        if (!worker_error) worker_error = std::current_exception();
+    };
+
+    auto worker = [&](size_t worker_id) {
+        try {
+            const size_t flush_thresh = writer_flush_threshold(n_parts, 64u << 20);
+            MinimizerWindow<k, m> min_it;
+            std::vector<SuperkmerWriter<k, m>> writers(n_parts, SuperkmerWriter<k, m>(flush_thresh));
+            std::vector<uint8_t> kache_buf;
+            uint64_t local_seqs = 0, local_kmers = 0, local_superkmers = 0;
+
+            auto flush_fn = [&](std::vector<SuperkmerWriter<k, m>>& ws, size_t p) {
+                if (ws[p].needs_flush()) ws[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+            };
+
+            while (true) {
+                Batch batch;
+                size_t stream_id = 0;
+                bool do_parse = false;
+                bool do_produce = false;
+
+                {
+                    std::unique_lock<std::mutex> lk(q_mutex);
+                    const uint64_t wait_start = queue_stats ? phase1_now_ns() : 0;
+                    q_cv.wait(lk, [&]{
+                        return stop.load(std::memory_order_relaxed) ||
+                               !batches.empty() ||
+                               (!ready_streams.empty() && pending_bases < high_batch_bases) ||
+                               active_streams == 0;
+                    });
+                    if (queue_stats) worker_stats[worker_id].wait_ns += phase1_now_ns() - wait_start;
+                    if (stop.load(std::memory_order_relaxed)) break;
+
+                    const bool can_parse = !batches.empty();
+                    const bool can_produce = !ready_streams.empty() && pending_bases < high_batch_bases;
+                    if (can_parse && (!can_produce || pending_bases >= low_batch_bases)) {
+                        batch = std::move(batches.front());
+                        batches.pop_front();
+                        pending_bases -= batch.bases;
+                        do_parse = true;
+                    } else if (can_produce) {
+                        stream_id = ready_streams.front();
+                        ready_streams.pop_front();
+                        do_produce = true;
+                    } else if (can_parse) {
+                        batch = std::move(batches.front());
+                        batches.pop_front();
+                        pending_bases -= batch.bases;
+                        do_parse = true;
+                    } else if (active_streams == 0) {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                q_cv.notify_all();
+
+                if (do_produce) {
+                    ++worker_stats[worker_id].decompress_tasks;
+                    Batch produced;
+                    produced.reserve(MAX_BATCH_ITEMS, TARGET_BATCH_BASES);
+                    size_t produced_bases = 0;
+                    bool eof = false;
+                    auto& parser = *streams[stream_id].parser;
+                    while (!stop.load(std::memory_order_relaxed) &&
+                           produced_bases < TARGET_BATCH_BASES &&
+                           produced.records.size() < MAX_BATCH_ITEMS) {
+                        if (!parser.next()) {
+                            eof = true;
+                            break;
+                        }
+                        const size_t len = parser.get_dna_len();
+                        if (len >= k) {
+                            produced.append(parser.get_dna_packed());
+                            produced_bases += len;
+                        }
+                    }
+
+                    if (!produced.empty()) {
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            pending_bases += produced.bases;
+                            batches.push_back(std::move(produced));
+                            max_queue_depth = std::max(max_queue_depth, batches.size());
+                            max_pending_bases = std::max(max_pending_bases, pending_bases);
+                        }
+                        ++worker_stats[worker_id].decompressed_chunks;
+                        worker_stats[worker_id].decompressed_bytes += produced_bases;
+                    }
+
+                    if (!eof && !stop.load(std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lk(q_mutex);
+                        ready_streams.push_back(stream_id);
+                    } else {
+                        streams[stream_id].parser.reset();
+                        std::string next_path;
+                        {
+                            std::lock_guard<std::mutex> lk(q_mutex);
+                            if (next_file < n_files) {
+                                next_path = cfg.input_files[next_file++];
+                                ++opened_streams;
+                            } else {
+                                --active_streams;
+                            }
+                        }
+                        if (!next_path.empty()) {
+                            GzInput inp(next_path);
+                            auto next_parser = std::make_unique<AdaptivePackedFastqParser>(std::move(inp));
+                            {
+                                std::lock_guard<std::mutex> lk(q_mutex);
+                                streams[stream_id].parser = std::move(next_parser);
+                                ready_streams.push_back(stream_id);
+                            }
+                        }
+                    }
+                    q_cv.notify_all();
+                    continue;
+                }
+
+                if (do_parse) {
+                    ++worker_stats[worker_id].parse_tasks;
+                    ++worker_stats[worker_id].parsed_chunks;
+                    worker_stats[worker_id].records += batch.records.size();
+                    worker_stats[worker_id].bases += batch.bases;
+                    for (const auto& rec : batch.records) {
+                        if (stop.load(std::memory_order_relaxed)) break;
+                        PackedReadView chunk{
+                            batch.words.data() + rec.word_offset,
+                            rec.word_count,
+                            rec.tail,
+                            rec.len
+                        };
+#ifdef TUNA_PACKED_NT_PHASE1
+                        extract_superkmers_from_packed_nt<k, m>(
+                            chunk, partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#else
+                        decode_packed_nt_to_kache(chunk, kache_buf);
+                        extract_superkmers_from_kache<k, m>(
+                            kache_buf.data(), kache_buf.size(), partition_fn, min_it, writers,
+                            local_kmers, local_superkmers, flush_fn);
+#endif
+                        ++local_seqs;
+                    }
+                }
+            }
+
+            for (size_t p = 0; p < n_parts; ++p)
+                writers[p].flush_to_mem(bufs[p], buf_mutexes[p]);
+
+            total_seqs.fetch_add(local_seqs, std::memory_order_relaxed);
+            total_kmers.fetch_add(local_kmers, std::memory_order_relaxed);
+            total_superkmers.fetch_add(local_superkmers, std::memory_order_relaxed);
+            worker_stats[worker_id].kmers += local_kmers;
+            worker_stats[worker_id].superkmers += local_superkmers;
+        } catch (...) {
+            record_error();
+            stop.store(true, std::memory_order_relaxed);
+            q_cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t)
+        threads.emplace_back(worker, t);
+    for (auto& th : threads) th.join();
+    if (worker_error) std::rethrow_exception(worker_error);
+    if (queue_stats) {
+        phase1_print_adaptive_stats(
+            "mem_adaptive_packed_gz_fastq", worker_stats, max_queue_depth,
+            max_pending_bases, low_batch_bases, high_batch_bases, opened_streams);
+    }
+
+    return { total_seqs.load(), total_kmers.load(), total_superkmers.load() };
+}
 
 
 // ─── Producer-consumer harness for a single gz file ──────────────────────────
@@ -1761,6 +2734,17 @@ PartitionStats partition_kmers_impl(
                 all_plain = false;
             }
         }
+        if (cfg.phase1_adaptive && all_gz) {
+            if (phase1_adaptive_all_gz_fastq(cfg, all_gz)) {
+                if (n_files == 1)
+                    return partition_kmers_single_gz_fastq_raw_pc<k, m>(
+                        cfg, cfg.input_files[0], buckets, partition_fn, write_budget_per_thread);
+                return partition_kmers_adaptive_packed_gz_fastq_pc<k, m>(
+                    cfg, buckets, partition_fn, write_budget_per_thread);
+            }
+            if (!cfg.hide_progress)
+                std::cerr << "tuna: note: -p1-adaptive currently supports only gz FASTQ; using default phase 1\n";
+        }
         if (all_gz && n_files == 1 && gz_first_byte(cfg.input_files[0]) == '@')
             return partition_kmers_single_gz_fastq_raw_pc<k, m>(
                 cfg, cfg.input_files[0], buckets, partition_fn, write_budget_per_thread);
@@ -2083,6 +3067,17 @@ PartitionStats partition_kmers_mem_impl(
                 all_gz = false;
                 break;
             }
+        }
+        if (cfg.phase1_adaptive && all_gz) {
+            if (phase1_adaptive_all_gz_fastq(cfg, all_gz)) {
+                if (n_files == 1)
+                    return partition_kmers_mem_single_gz_fastq_raw_pc<k, m>(
+                        cfg, cfg.input_files[0], bufs, partition_fn);
+                return partition_kmers_mem_adaptive_packed_gz_fastq_pc<k, m>(
+                    cfg, bufs, partition_fn);
+            }
+            if (!cfg.hide_progress)
+                std::cerr << "tuna: note: -p1-adaptive currently supports only gz FASTQ; using default phase 1\n";
         }
         if (all_gz && n_files == 1 && gz_first_byte(cfg.input_files[0]) == '@')
             return partition_kmers_mem_single_gz_fastq_raw_pc<k, m>(
